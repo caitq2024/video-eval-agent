@@ -57,14 +57,33 @@
         <td>角色服装/道具/风格在镜头间漂移（镜头1蓝衣镜头3变红衣）—— 主流评估的盲区，多镜头 Agent 独有</td>
         <td>主体跨镜头色相直方图距离 + 每镜头代表帧并排</td>
         <td>VLM 封闭式问题（同一角色？服装/风格是否延续？）；色相探针同报时标双重验证</td><td>已落地</td></tr>
+      <tr><td>T12</td><td>人体/手部解剖 <span class="tag vlm">v2</span></td>
+        <td>多余/缺失肢体、融指断指、骨长帧间漂移、握持结构崩坏 —— 用户感知最刺眼的一类</td>
+        <td>KeypointRCNN 逐帧关键点 → 相对骨长时间维变异 >0.35；腕部区域自动裁剪</td>
+        <td>手部/持物区域放大并排 → VLM 逐个核查（指数/融指/握持接触）</td><td>已落地</td></tr>
+      <tr><td>T13</td><td>物理违反 <span class="tag vlm">v2</span></td>
+        <td>重力/动量违反、弹跳不衰减、倒影错位、状态不持久 —— 所有模型公认最弱项（VideoPhy-2 最佳仅~22%）</td>
+        <td>分镜 prompt 含物理动词（bounce/fall/pour…）触发</td>
+        <td>PhyGenEval 式：VLM 先生成物理断言再逐条对照 8 帧核查</td><td>已落地</td></tr>
+      <tr><td>T14</td><td>穿模/交互失真 <span class="tag vlm">v2</span></td>
+        <td>持物悬空（道具无接触跟随人物）、手穿透物体、把手重复/断裂 —— 评测工具最空白的方向</td>
+        <td>人/物 bbox 邻接探针定位交互区域（gap &lt; 道具对角线 30%）</td>
+        <td>交互区域三时刻放大并排 → VLM 判接触物理合理性（双重验证）</td><td>已落地</td></tr>
+      <tr><td>T15</td><td>画面文字错误 <span class="tag vlm">v2</span></td>
+        <td>拼写错误、乱码、帧间文字漂移 —— 电商/广告场景字错 = 素材报废</td>
+        <td>wan_prompt 引号/大写词提取应现文字；牌匾主体区域裁剪</td>
+        <td>VLM 逐帧读字 + 与要求比对 + 跨帧稳定性</td><td>已落地</td></tr>
+      <tr><td>T16</td><td>相机运镜不符 <span class="tag vlm">v2</span></td>
+        <td>运镜类型/方向错误（要 static 却漂移）—— 与 T4 的区别：T4 是内容切换，T16 是机位错误</td>
+        <td>RAFT 全局光流平移中位数 + 径向散度 vs 分镜 camera 字段</td>
+        <td>高置信矛盾直判（static 却 &gt;60% 时间在平移）</td><td>已落地</td></tr>
       <tr><td>T20</td><td>管线执行缺陷 <span class="tag vlm">v2</span></td>
         <td>转场执行残影/硬跳、成片规格不符（时长/帧率）、导演改写丢失创意要素 —— 生成 Agent 独有</td>
         <td>ffprobe 对照分镜 JSON；转场窗内帧差形状；LLM 文本要素覆盖 diff（文献空白项）</td>
         <td>规格/转场直判；改写忠实度 LLM 文本裁决</td><td>已落地</td></tr>
     </table>
-    <p class="note" style="margin-top:8px">v2 分类共 20 类：其余 T12 人体解剖运动学（MMPose 骨长/关节角）、T13 物理违反、
-    T14 穿模交互、T15 画面文字（OCR 时序一致性）、T16 相机运镜、T18 局部画质劣化已完成文献调研与探针设计
-    （TAXONOMY_V2_proposal.md），按成本×价值分批落地中。</p>
+    <p class="note" style="margin-top:8px">v2 分类共 20 类（TAXONOMY_V2_proposal.md），T18 局部画质劣化待落地；
+    T15 的 OCR 帧间一致性探针、T14 的 SAM2+深度排序几何探针、T16 的 CoTracker 运镜细分类为后续增强项。</p>
   </div>
 
   <h2>各类缺陷示例（合成注入黄金集，评估管线即在此集上校准出 95% 拦截率）</h2>

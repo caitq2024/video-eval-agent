@@ -397,9 +397,10 @@ def subject_probes(film, meta, model, spans, fps, device):
                         break        # 每主体每分镜最多报一处，交 VLM 精查
     # 逐子采样帧的主体在场轨迹（供 VLM 裁决交叉验证：像素证据优先于 VLM 印象）
     presence = {s: [b is not None for b in dets[s]] for s in subjects}
+    boxes = {s: [b[1] if b else None for b in dets[s]] for s in subjects}
     return findings, {'candidates': cand, 'track_rates': track_rates,
                       'presence': presence, 'sub_fps': sub_fps,
-                      'shot_hue': shot_hue}
+                      'shot_hue': shot_hue, 'boxes': boxes}
 
 
 def detect_t11_blocks(sc, fps, ex, cuts, spans, shots, top_k=3):
@@ -685,6 +686,34 @@ def vlm_t17_loop(frames, ffps, c, meta, rubric):
     return parsed or {'verdict': 'PARSE_FAIL', 'reason': raw[:120]}
 
 
+def crop_strip(frames, ffps, items, th=280):
+    """items: [(t_s, box640_or_None, label)] → 标注时间戳的横向并排放大裁剪图。"""
+    import cv2
+    H, W = frames[0].shape[:2]
+    sx, sy = W / 640.0, H / 360.0
+    tiles = []
+    for t_s, box, label in items:
+        fi = min(len(frames) - 1, max(0, int(t_s * ffps)))
+        f = frames[fi]
+        if box:
+            x0, y0 = int(box[0] * sx), int(box[1] * sy)
+            x1, y1 = int(box[2] * sx), int(box[3] * sy)
+            bw, bh = x1 - x0, y1 - y0
+            x0, y0 = max(0, int(x0 - 0.2 * bw)), max(0, int(y0 - 0.2 * bh))
+            x1, y1 = min(W, int(x1 + 0.2 * bw)), min(H, int(y1 + 0.2 * bh))
+            crop = f[y0:y1, x0:x1] if (x1 - x0 >= 24 and y1 - y0 >= 24) else f
+        else:
+            crop = f
+        tile = cv2.resize(crop, (max(80, int(th * crop.shape[1] / crop.shape[0])), th))
+        cv2.rectangle(tile, (0, 0), (152, 24), (0, 0, 0), -1)
+        cv2.putText(tile, f'{label} {t_s:.2f}s', (4, 17),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        tiles.append(tile)
+    hm = max(t.shape[0] for t in tiles)
+    return np.hstack([np.pad(t, ((0, hm - t.shape[0]), (0, 6), (0, 0)),
+                             constant_values=24) for t in tiles])
+
+
 # ---------------------------------------------------------------- S4/S5 VLM
 def make_rubric(meta):
     shots_txt = '\n'.join(f'Shot {s["shot_id"]}: {s["wan_prompt"]}' for s in meta['shots'])
@@ -759,6 +788,9 @@ def score_findings(findings, t10):
     dim_of = {'T1_jump': 'temporal', 'T2_flicker': 'temporal', 'T3_freeze': 'temporal',
               'T11_local_incoherence': 'temporal', 'T17_motion_dynamics': 'temporal',
               'T19_cross_shot': 'subject', 'T20_pipeline': 'structural',
+              'T12_anatomy': 'subject', 'T13_physics': 'semantic',
+              'T14_interaction': 'subject', 'T15_text': 'semantic',
+              'T16_camera_motion': 'semantic',
               'T4_unexpected_cut': 'structural', 'T6_black': 'structural',
               'T5_out_of_frame': 'subject', 'T7_deform': 'subject',
               'T8_identity_drift': 'subject', 'T9_vanish': 'subject',
@@ -837,6 +869,37 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
         sub_findings, sub_info = [], {'error': str(e)[:300]}
     findings = merge_findings(findings + sub_findings)
     timing['s3_probes_s'] = round(time.time() - t0, 2)
+
+    # S3b v2 第二批探针：T12 人体关键点 / T14 交互区域 / T16 相机运动 / T15 文字
+    t0 = time.time()
+    import probes_v2 as PV2
+    person_kw = ('person', 'man', 'woman', 'soldier', 'pedestrian', 'fencer',
+                 'player', 'elderly', 'people', 'figure', 'dog', 'corgi')
+    has_person = any(any(k in x.lower() for k in person_kw[:10])
+                     for s in meta['shots'] for x in s.get('expected_subjects', []))
+    t12_cands, hand_regs = [], []
+    kfps = None
+    if has_person:
+        try:
+            sub_frames = decode_sub(film)
+            kps = PV2.person_keypoints(sub_frames[::2], device)
+            kfps = (fps / SUB_EVERY) / 2
+            t12_cands = PV2.t12_bone_stats(kps, kfps, spans, meta['shots'])
+            hand_regs = PV2.wrist_regions(kps, kfps, spans, 640, 360)
+        except Exception as e:
+            print('[v2] keypoint probe fail:', str(e)[:120])
+    inter_regs = PV2.interaction_regions(sub_info, spans,
+                                         sub_info.get('sub_fps') or fps / 3, meta)
+    findings += PV2.t16_camera_check(sc.get('camera_flow', {}), fps, spans,
+                                     meta['shots'], None)
+    text_shots = [(k, s, PV2.prompt_texts(s)) for k, s in enumerate(meta['shots'])
+                  if k < len(spans) and PV2.prompt_texts(s)]
+    import re as _re
+    PHYS = _re.compile(r'bounc|fall|drop|pour|splash|roll|slide|toss|throw|'
+                       r'gravity|ripple|settle|rebound')
+    phys_shots = [(k, s) for k, s in enumerate(meta['shots'])
+                  if k < len(spans) and PHYS.search(s['wan_prompt'].lower())][:2]
+    timing['s3b_v2_s'] = round(time.time() - t0, 2)
 
     # S4 fusion windows + VLM adjudication
     t0 = time.time()
@@ -1033,6 +1096,149 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                             confidence=float(v.get('confidence', 0.7)),
                             verdict_by='dual')
 
+        import vlm_common as V
+
+        def judge_t12_hands():
+            """手部/持物区域批量核查（一张并排图一次调用）—— p4 类雨伞/手缺陷主打。"""
+            if not hand_regs:
+                return []
+            items = [(t, box, f'H{i + 1}') for i, (t, box, sh)
+                     in enumerate(hand_regs[:6])]
+            strip = crop_strip(frames, ffps, items)
+            p = (f'You are inspecting HAND/GRIP regions of an AI-generated video '
+                 f'(idea: "{meta["idea"]}"). Each labeled crop (H1..H{len(items)}) is an '
+                 f'enlarged wrist/hand region, possibly holding a prop.\n'
+                 f'For EACH crop judge: finger count/anatomy normal? hand merged/'
+                 f'broken? grip physically plausible (prop floating with no hand '
+                 f'contact, hand passing through handle, duplicated handles)?\n'
+                 f'STRICT RULE: report ONLY clearly VISIBLE structural anomalies: '
+                 f'wrong finger count, fused/broken hand, prop floating with no '
+                 f'contact, duplicated/extra handles or hooks, hand passing through '
+                 f'object. For FINGER DETAILS only: silhouette/DoF/motion blur where '
+                 f'fingers simply cannot be seen is NOT a defect — but object-level '
+                 f'structure (double handle, detached handle, floating prop) IS '
+                 f'judgeable even in silhouette.\n'
+                 f'Respond ONLY with JSON: {{"abnormal": [{{"id": "H1", '
+                 f'"severity": 1-5, "issue": "<简体中文简述>"}}]}} '
+                 f'(empty list if all normal)')
+            parsed, _ = ask_claude([{'text': p}, V.img_block(strip)])
+            out = []
+            for ab in (parsed or {}).get('abnormal', []):
+                try:
+                    i = int(str(ab.get('id', 'H1'))[1:]) - 1
+                    t_s, _, sh = hand_regs[i]
+                except (ValueError, IndexError):
+                    continue
+                out.append(dict(type='T12_anatomy', start_s=t_s,
+                                end_s=round(t_s + 0.5, 2),
+                                severity=int(ab.get('severity', 3)),
+                                evidence=f'手部/持物核查（分镜{sh}）：'
+                                         f'{ab.get("issue", "")}'[:200],
+                                confidence=0.8, verdict_by='vlm'))
+            return out
+
+        def judge_t12_bone(c):
+            a, b = c['start_s'], c['end_s']
+            items = [(a + (b - a) * f, None, 'ABC'[i])
+                     for i, f in enumerate((0.2, 0.5, 0.8))]
+            strip = crop_strip(frames, ffps, items)
+            p = (f'A pose probe flagged shot {c["shot"]}: {c["signal"]}. Below are 3 '
+                 f'frames (A/B/C). Judge: do the person\'s limbs stay anatomically '
+                 f'consistent (no limb morphing/stretching/extra limbs) across frames? '
+                 f'Perspective changes are acceptable.\n'
+                 f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", '
+                 f'"severity": 1-5, "reason": "<简体中文>", "confidence": 0.0-1.0}}')
+            parsed, _ = ask_claude([{'text': p}, V.img_block(strip)])
+            v = parsed or {}
+            if v.get('verdict') == 'defect':
+                return dict(type='T12_anatomy', start_s=a, end_s=b,
+                            severity=int(v.get('severity', 3)),
+                            evidence=f'人体骨长变异（分镜{c["shot"]}，{c["signal"]}）：'
+                                     f'{v.get("reason", "")}'[:220],
+                            confidence=float(v.get('confidence', 0.7)),
+                            verdict_by='dual')
+
+        def judge_t14(r):
+            items = [(max(0, r['t_s'] + d), r['box640'], 'ABC'[i])
+                     for i, d in enumerate((-0.4, 0.0, 0.4))]
+            strip = crop_strip(frames, ffps, items)
+            p = (f'Inspect the INTERACTION between "{r["person"]}" and "{r["prop"]}" '
+                 f'in shot {r["shot"]} of an AI video (3 enlarged crops A/B/C, ~0.4s '
+                 f'apart). Judge ONLY physical interaction plausibility: is the prop '
+                 f'held/supported by a hand with real contact? any floating prop that '
+                 f'follows the person with NO contact, hand passing through the prop, '
+                 f'duplicated/broken handles, or contact at an impossible point?\n'
+                 f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", '
+                 f'"severity": 1-5, "reason": "<简体中文>", "confidence": 0.0-1.0}}')
+            parsed, _ = ask_claude([{'text': p}, V.img_block(strip)])
+            v = parsed or {}
+            if v.get('verdict') == 'defect':
+                return dict(type='T14_interaction', start_s=round(r['t_s'] - 0.4, 2),
+                            end_s=round(r['t_s'] + 0.4, 2),
+                            severity=int(v.get('severity', 3)),
+                            evidence=f'{r["person"]}×{r["prop"]} 交互（分镜{r["shot"]}）：'
+                                     f'{v.get("reason", "")}'[:220],
+                            confidence=float(v.get('confidence', 0.7)),
+                            verdict_by='dual')
+
+        def judge_t15(k, s, texts):
+            a, b = spans[k]
+            sign_box_key = next((x for x in sub_info.get('boxes', {})
+                                 if any(w in x.lower() for w in
+                                        ('sign', 'text', 'label', 'logo'))), None)
+            bxs = sub_info.get('boxes', {}).get(sign_box_key, [])
+            sfps = sub_info.get('sub_fps') or fps / 3
+            items = []
+            for i, f in enumerate((0.25, 0.5, 0.8)):
+                t_s = a + (b - a) * f
+                bx = bxs[min(len(bxs) - 1, int(t_s * sfps))] if bxs else None
+                items.append((t_s, bx, 'ABC'[i]))
+            strip = crop_strip(frames, ffps, items)
+            p = (f'Shot {k + 1} requires on-screen text: {texts}. Below are 3 frames '
+                 f'(A/B/C) with the text region enlarged when detected.\n'
+                 f'(1) Read the actual visible text in each frame. (2) Is it exactly '
+                 f'the required text (no missing/garbled letters)? (3) Is it stable '
+                 f'across frames (no morphing/drifting glyphs)?\n'
+                 f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", '
+                 f'"read": ["<各帧读到的>"], "severity": 1-5, '
+                 f'"reason": "<简体中文>", "confidence": 0.0-1.0}}')
+            parsed, _ = ask_claude([{'text': p}, V.img_block(strip)])
+            v = parsed or {}
+            if v.get('verdict') == 'defect':
+                return dict(type='T15_text', start_s=round(a, 2), end_s=round(b, 2),
+                            severity=int(v.get('severity', 3)),
+                            evidence=f'画面文字应为 {texts}，实际 {v.get("read", "?")}'
+                                     f'（分镜{k + 1}）：{v.get("reason", "")}'[:220],
+                            confidence=float(v.get('confidence', 0.7)),
+                            verdict_by='vlm')
+
+        def judge_t13(k, s):
+            a, b = spans[k]
+            n_f = len(frames)
+            ids = [min(n_f - 1, int((a + (b - a) * (i + 0.5) / 8) * ffps))
+                   for i in range(8)]
+            sheet = V.contact_sheet([(frames[j], j / ffps) for j in ids],
+                                    cols=4, tile_w=300)
+            p = (f'Physics check for shot {k + 1} of an AI video.\n'
+                 f'Shot prompt: "{s["wan_prompt"]}"\n'
+                 f'Step 1: state 2-3 physics assertions this scene must satisfy '
+                 f'(gravity/momentum/contact response/state persistence, e.g. "a '
+                 f'bouncing ball\'s rebound height must decrease").\n'
+                 f'Step 2: check each against the 8 frames (timestamps burned in).\n'
+                 f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", '
+                 f'"violated": ["<被违反的断言,中文>"], "severity": 1-5, '
+                 f'"reason": "<简体中文>", "confidence": 0.0-1.0}}')
+            parsed, _ = ask_claude([{'text': p}, V.img_block(sheet)])
+            v = parsed or {}
+            if v.get('verdict') == 'defect':
+                return dict(type='T13_physics', start_s=round(a, 2), end_s=round(b, 2),
+                            severity=int(v.get('severity', 3)),
+                            evidence=f'物理断言违反（分镜{k + 1}）：'
+                                     f'{"；".join(v.get("violated", [])[:3])} —— '
+                                     f'{v.get("reason", "")}'[:220],
+                            confidence=float(v.get('confidence', 0.7)),
+                            verdict_by='vlm')
+
         # 除 rubric 外全部 VLM 调用并行（Bedrock 侧无依赖）
         with ThreadPoolExecutor(max_workers=16) as pool:
             fut_wins = [pool.submit(judge_window, w) for w in wins]
@@ -1044,6 +1250,12 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
             fut_t19 = pool.submit(judge_t19) if len(spans) >= 2 else None
             fut_loops = [pool.submit(judge_loop, c) for c in t17_loop_cands]
             fut_rw = pool.submit(check_rewrite_fidelity, meta, pdir)
+            # v2 第二/三批：T12 手部+骨长 / T14 交互 / T15 文字 / T13 物理
+            fut_hands = pool.submit(judge_t12_hands) if hand_regs else None
+            fut_bones = [pool.submit(judge_t12_bone, c) for c in t12_cands[:2]]
+            fut_inter = [pool.submit(judge_t14, r) for r in inter_regs]
+            fut_text = [pool.submit(judge_t15, k, s, tx) for k, s, tx in text_shots]
+            fut_phys = [pool.submit(judge_t13, k, s) for k, s in phys_shots]
             for f in fut_wins + fut_cands:
                 vlm_calls += 1
                 r = f.result()
@@ -1060,11 +1272,15 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                     t10.append(med)
                 else:
                     t10.append(votes[0])
-            for f in ([fut_t19] if fut_t19 else []) + fut_loops:
+            for f in ([fut_t19] if fut_t19 else []) + fut_loops + fut_bones \
+                    + fut_inter + fut_text + fut_phys:
                 vlm_calls += 1
                 r = f.result()
                 if r:
                     findings.append(r)
+            if fut_hands:
+                vlm_calls += 1
+                findings += fut_hands.result()
             rw = fut_rw.result()
             vlm_calls += 1
             if rw.get('missing_critical'):
@@ -1077,6 +1293,7 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
         t10.sort(key=lambda x: x['shot_id'])
         timing['s4_vlm_s'] = round(time.time() - t0, 2)
 
+    findings = merge_findings(findings)      # 终段合并（VLM 各通道可能报同窗同类）
     timing['total_s'] = round(time.time() - t_all, 2)
     timing['vlm_calls'] = vlm_calls
 

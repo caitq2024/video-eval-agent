@@ -105,7 +105,17 @@ class GpuWorker:
         # 跨块比较无效，必须逐块和自己的历史比）——见 T11 提案 §2/§4
         blocks = torch.nn.functional.adaptive_avg_pool2d(res.unsqueeze(1), (8, 8))
         bflat = blocks.squeeze(1).flatten(1) * 255.0               # B-1,64
-        return mean_r, bflat
+        # T16 相机运动：全局平移中位数 + 径向散度（zoom 探针）
+        B = flow.shape[0]
+        dx = flow[:, 0].reshape(B, -1).median(dim=1).values
+        dy = flow[:, 1].reshape(B, -1).median(dim=1).values
+        cx, cy = (FW - 1) / 2, (FH - 1) / 2
+        rx = (self.base_grid[..., 0] - cx) / FW
+        ry = (self.base_grid[..., 1] - cy) / FH
+        rn = torch.sqrt(rx ** 2 + ry ** 2) + 1e-6
+        div = ((flow[:, 0] * rx / rn + flow[:, 1] * ry / rn)
+               .reshape(B, -1).mean(dim=1))
+        return mean_r, bflat, dx, dy, div
 
 
 _WORKERS = {}          # device -> GpuWorker（批量评估时跨视频复用，省 ~8s/条）
@@ -126,7 +136,7 @@ def scan(path, device='cuda:0'):
     th.start()
 
     lum, d1_parts, hsv_diff = [], [], []
-    feats, warps, wblocks = [], [], []
+    feats, warps, wblocks, fdx, fdy, fdiv = [], [], [], [], [], []
     prev_rgb_gpu = None           # 上一 chunk 末帧(GPU, 1,3,H,W)
     carry_small = None            # 跨 chunk 的最后一帧(RAFT 连续性)
     n = 0
@@ -167,9 +177,12 @@ def scan(path, device='cuda:0'):
             if carry_small is not None:
                 small = torch.cat([carry_small, small])
             if small.shape[0] >= 2:
-                mr, bf = worker.raft_warp_residual(small)
+                mr, bf, dx, dy, dv = worker.raft_warp_residual(small)
                 warps.append(mr)
                 wblocks.append(bf)
+                fdx.append(dx)
+                fdy.append(dy)
+                fdiv.append(dv)
             carry_small = small[-1:]
         n = idx + len(frames)
     torch.cuda.synchronize()
@@ -180,6 +193,9 @@ def scan(path, device='cuda:0'):
     clip_d[1:] = 1 - (feats[1:] * feats[:-1]).sum(-1).cpu()
     warp = torch.cat([torch.zeros(1, device=device)] + warps).cpu().numpy()
     wb = torch.cat([torch.zeros(1, 64, device=device)] + wblocks).cpu().numpy()  # T,64
+    z1 = [torch.zeros(1, device=device)]
+    cam = {k: torch.cat(z1 + v).cpu().numpy()
+           for k, v in (('dx', fdx), ('dy', fdy), ('div', fdiv))}
     la = np.asarray(lum)
     flick = np.zeros(n)
     flick[1:-1] = np.abs(la[1:-1] - (la[:-2] + la[2:]) / 2)
@@ -198,6 +214,7 @@ def scan(path, device='cuda:0'):
                        'warp_residual': np.round(warp, 2).tolist(),
                        'warp_block_max': np.round(wb.max(axis=1), 2).tolist()},
            'warp_blocks': np.round(wb, 1).tolist(),
+           'camera_flow': {k: np.round(v, 3).tolist() for k, v in cam.items()},
            'cuts_frames': cuts}
     return out
 

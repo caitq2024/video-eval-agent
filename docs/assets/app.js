@@ -4,7 +4,10 @@ const TYPE_ZH = {
   T3_freeze: 'T3 冻结', T4_unexpected_cut: 'T4 意外切换', T5_out_of_frame: 'T5 主体出界',
   T6_black: 'T6 黑帧', T7_deform: 'T7 主体变形', T8_identity_drift: 'T8 身份漂移',
   T9_vanish: 'T9 凭空消失', T10_misalignment: 'T10 语义不符',
-  T11_local_incoherence: 'T11 局部时序不连贯', T17_motion_dynamics: 'T17 运动动态性',
+  T11_local_incoherence: 'T11 局部时序不连贯', T12_anatomy: 'T12 人体/手部解剖',
+  T13_physics: 'T13 物理违反', T14_interaction: 'T14 穿模/交互失真',
+  T15_text: 'T15 画面文字错误', T16_camera_motion: 'T16 运镜不符',
+  T17_motion_dynamics: 'T17 运动动态性',
   T19_cross_shot: 'T19 跨镜头一致性', T20_pipeline: 'T20 管线执行',
   vlm_defect: 'VLM 判定缺陷',
 };
