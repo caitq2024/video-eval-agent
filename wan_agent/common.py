@@ -45,11 +45,22 @@ def bedrock():
     return _client
 
 
-def ask_claude(blocks, max_tokens=1500, model=CLAUDE):
-    """blocks: converse content blocks。返回 (parsed_json_or_None, raw_text)。"""
-    r = bedrock().converse(modelId=model,
-                           messages=[{'role': 'user', 'content': blocks}],
-                           inferenceConfig={'maxTokens': max_tokens, 'temperature': 0.0})
+def ask_claude(blocks, max_tokens=1500, model=CLAUDE, retries=4):
+    """blocks: converse content blocks。返回 (parsed_json_or_None, raw_text)。
+    并行裁决下可能遇到 Bedrock 限流，指数退避重试。"""
+    import random
+    import time
+    for attempt in range(retries + 1):
+        try:
+            r = bedrock().converse(
+                modelId=model,
+                messages=[{'role': 'user', 'content': blocks}],
+                inferenceConfig={'maxTokens': max_tokens, 'temperature': 0.0})
+            break
+        except Exception as e:
+            if attempt >= retries or 'Throttl' not in type(e).__name__ + str(e):
+                raise
+            time.sleep(1.5 ** attempt + random.random())
     text = r['output']['message']['content'][0]['text']
     m = re.search(r'\{.*\}', text, re.S)
     if not m:

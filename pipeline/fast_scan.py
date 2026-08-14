@@ -101,11 +101,16 @@ class GpuWorker:
         return (warped - small_gpu[:-1]).abs().mean(dim=(1, 2, 3)) * 255.0
 
 
+_WORKERS = {}          # device -> GpuWorker（批量评估时跨视频复用，省 ~8s/条）
+
+
 def scan(path, device='cuda:0'):
     fps = probe_meta(path)
     torch.cuda.set_device(device)
     t_load0 = time.time()
-    worker = GpuWorker(device)
+    if device not in _WORKERS:
+        _WORKERS[device] = GpuWorker(device)
+    worker = _WORKERS[device]
     load_s = time.time() - t_load0
 
     q = Queue(maxsize=4)

@@ -128,7 +128,7 @@ def detect_hard(sig, cuts, fps, meta, model, spans, trans):
     for a, b in runs_where(lum < TH['black_lum']):
         if b - a >= TH['black_run']:
             F.append(dict(type='T6_black', start_s=a / fps, end_s=b / fps, severity=5,
-                          evidence=f'luminance<{TH["black_lum"]} for {b - a} frames',
+                          evidence=f'亮度<{TH["black_lum"]} 持续 {b - a} 帧（全黑）',
                           confidence=0.99, verdict_by='detector'))
     # T3 冻结（低运动分镜先验：static+low 需 2 倍时长）
     for a, b in runs_where(d1 < TH['freeze_d1']):
@@ -138,8 +138,9 @@ def detect_hard(sig, cuts, fps, meta, model, spans, trans):
             need *= 2
         if b - a >= need and not ex[a:b].all():
             F.append(dict(type='T3_freeze', start_s=a / fps, end_s=b / fps, severity=4,
-                          evidence=f'diff_d1<{TH["freeze_d1"]} for {round((b - a) / fps, 2)}s '
-                                   f'(camera={s.get("camera")},motion={s.get("motion_level")})',
+                          evidence=f'帧差<{TH["freeze_d1"]} 持续 {round((b - a) / fps, 2)}s，'
+                                   f'画面完全静止（该分镜 camera={s.get("camera")}/'
+                                   f'motion={s.get("motion_level")}，已用 2 倍时长门槛仍触发）',
                           confidence=0.9, verdict_by='detector'))
     # T2 闪烁（孤立尖峰，避开转场/切点邻域）
     cutset = set(cuts)
@@ -147,7 +148,7 @@ def detect_hard(sig, cuts, fps, meta, model, spans, trans):
         if ex[i] or any(abs(int(i) - c) <= 2 for c in cutset):
             continue
         F.append(dict(type='T2_flicker', start_s=i / fps, end_s=(i + 1) / fps, severity=3,
-                      evidence=f'flicker={flick[i]:.1f}>{TH["flicker"]}',
+                      evidence=f'孤立亮度尖峰 {flick[i]:.1f}>{TH["flicker"]}（单帧闪烁）',
                       confidence=0.85, verdict_by='detector'))
     # T1 跳帧：真实生成视频运动大、warp 底噪高（wan2.1 中位数~5），
     # 绝对阈值会把整段高运动误判 —— 改判「孤立尖峰」：相对局部中位数 3 倍以上且邻帧回落
@@ -169,14 +170,16 @@ def detect_hard(sig, cuts, fps, meta, model, spans, trans):
                 continue
             F.append(dict(type='T1_jump', start_s=i / fps, end_s=min(n, i + 3) / fps,
                           severity=4,
-                          evidence=f'warp_residual={warp[k]:.1f} isolated spike '
-                                   f'({warp[k] / (local_med[k] + 1e-6):.1f}x local median)',
+                          evidence=f'光流 warp 残差 {warp[k]:.1f} 孤立尖峰'
+                                   f'（局部中位数的 {warp[k] / (local_med[k] + 1e-6):.1f} 倍，'
+                                   f'邻帧回落，内容瞬移）',
                           confidence=0.85, verdict_by='detector'))
     # T4 意外切换（转场豁免）
     for c in cuts:
         if not ex[min(c, n - 1)]:
             F.append(dict(type='T4_unexpected_cut', start_s=c / fps, end_s=(c + 1) / fps,
-                          severity=4, evidence='HSV frame diff>27 outside planned transition',
+                          severity=4,
+                          evidence='HSV 帧差>27 的硬切，且不在分镜计划的转场点上',
                           confidence=0.9, verdict_by='detector'))
     for f in F:
         f['start_s'] = round(f['start_s'], 2)
@@ -208,14 +211,20 @@ def decode_sub(path, w=640, h=360):
     return np.frombuffer(raw[:n * w * h * 3], np.uint8).reshape(n, h, w, 3)
 
 
+_GD_CACHE = {}          # device -> (processor, model)，批量评估跨视频复用
+
+
 def subject_probes(film, meta, model, spans, fps, device):
     """GroundingDINO 检测 expected_subjects → T5 候选/T7 变形/T8 色相漂移。"""
     import cv2
     import torch
-    from transformers import AutoProcessor, GroundingDinoForObjectDetection
-    proc = AutoProcessor.from_pretrained('IDEA-Research/grounding-dino-tiny')
-    gd = GroundingDinoForObjectDetection.from_pretrained(
-        'IDEA-Research/grounding-dino-tiny').to(device).eval()
+    if device not in _GD_CACHE:
+        from transformers import AutoProcessor, GroundingDinoForObjectDetection
+        _GD_CACHE[device] = (
+            AutoProcessor.from_pretrained('IDEA-Research/grounding-dino-tiny'),
+            GroundingDinoForObjectDetection.from_pretrained(
+                'IDEA-Research/grounding-dino-tiny').to(device).eval())
+    proc, gd = _GD_CACHE[device]
 
     frames = decode_sub(film)
     n = len(frames)
@@ -230,12 +239,13 @@ def subject_probes(film, meta, model, spans, fps, device):
     text = '. '.join(s.rstrip('.').lower() for s in subjects) + '.'
 
     dets = {s: [None] * n for s in subjects}
-    B = 12
+    B = 16
     with torch.no_grad():
         for i in range(0, n, B):
             batch = [frames[j] for j in range(i, min(i + B, n))]
             inp = proc(images=batch, text=[text] * len(batch), return_tensors='pt').to(device)
-            out = gd(**inp)
+            with torch.autocast('cuda'):
+                out = gd(**inp)
             res = proc.post_process_grounded_object_detection(
                 out, inp.input_ids, threshold=TH['det_th'], text_threshold=0.25,
                 target_sizes=[(360, 640)] * len(batch))
@@ -246,7 +256,6 @@ def subject_probes(film, meta, model, spans, fps, device):
                         if any(w in lb for w in key_words):
                             if dets[s][i + k] is None or sc > dets[s][i + k][0]:
                                 dets[s][i + k] = (float(sc), [float(v) for v in bx])
-    del gd
     torch.cuda.empty_cache()
 
     findings, cand = [], []
@@ -315,8 +324,8 @@ def subject_probes(film, meta, model, spans, fps, device):
                                 type='T7_deform_candidate', subject=subj, shot=k + 1,
                                 start_s=round(idxs[j - 2] / sub_fps, 2),
                                 end_s=round((idxs[j] + 1) / sub_fps, 2),
-                                signal=f'bbox log-aspect drift {abs(v - med):.2f}'
-                                       f'>{de_th:.2f} sustained (motion={motion})'))
+                                signal=f'bbox 纵横比 log 偏移 {abs(v - med):.2f}'
+                                       f'>{de_th:.2f} 且持续（motion={motion}）'))
                             break
                     else:
                         run = 0
@@ -336,8 +345,8 @@ def subject_probes(film, meta, model, spans, fps, device):
                                 type='T8_drift_candidate', subject=subj, shot=k + 1,
                                 start_s=round((i - 2) / sub_fps, 2),
                                 end_s=round((i + 1) / sub_fps, 2),
-                                signal=f'hue-hist cos dist {dcos:.2f}'
-                                       f'>{TH["hue_drift"]} sustained'))
+                                signal=f'色相直方图余弦距离 {dcos:.2f}'
+                                       f'>{TH["hue_drift"]} 且持续'))
                             break
                     else:
                         run = 0
@@ -352,7 +361,8 @@ def make_rubric(meta):
          f'{shots_txt}\n\nWrite 4-6 hard pass/fail criteria focused on: subject identity '
          'consistency within each shot, subject visibility, temporal continuity inside '
          'a shot (no unexpected cuts/jumps), and prompt adherence. '
-         'Respond ONLY with JSON: {"criteria": ["...", ...]}')
+         '每条标准用简体中文书写。'
+         'Respond ONLY with JSON: {"criteria": ["<中文标准>", ...]}')
     parsed, _ = ask_claude([{'text': p}])
     return (parsed or {}).get('criteria', [])
 
@@ -383,7 +393,7 @@ def vlm_window_verdict(frames, fps, win, meta, rubric, context):
          f'unintended exit, morphing, artifact), or is it acceptable/intentional?\n'
          f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", '
          f'"type": "<short defect type or none>", "severity": 1-5, '
-         f'"reason": "<short>", "confidence": 0.0-1.0}}')
+         f'"reason": "<简体中文简述，给中国客户看>", "confidence": 0.0-1.0}}')
     frames_ts = [(frames[k], k / fps) for k in ids]
     parsed, raw = ask_claude([{'text': p}, sheet_block(frames_ts)])
     return parsed or {'verdict': 'PARSE_FAIL', 'reason': raw[:120]}
@@ -400,8 +410,9 @@ def vlm_t10_alignment(frames, fps, span, shot, rubric):
          f'Below are 8 frames sampled uniformly from the shot.\n'
          f'Score 1-5: 5=faithful, 3=partial (subject/action/style deviations), '
          f'1=unrelated or subject missing. Also list missing elements.\n'
-         f'Respond ONLY with JSON: {{"score": 1-5, "missing": ["..."], '
-         f'"reason": "<short>"}}')
+         f'missing 与 reason 用简体中文书写（给中国客户看）。\n'
+         f'Respond ONLY with JSON: {{"score": 1-5, "missing": ["<中文>"], '
+         f'"reason": "<中文简述>"}}')
     frames_ts = [(frames[k], k / fps) for k in ids]
     parsed, raw = ask_claude([{'text': p}, sheet_block(frames_ts)])
     return parsed or {'score': None, 'reason': raw[:120]}
@@ -418,7 +429,10 @@ def score_findings(findings, t10):
     hard = []
     for f in findings:
         d = dim_of.get(f['type'], 'subject')
-        pen = f.get('severity', 3) * 6
+        # 惩罚随缺陷持续时长放大：整镜头冻结(4s+)要比 0.2s 尖峰重得多
+        dur = max(0.0, f.get('end_s', 0) - f.get('start_s', 0))
+        dur_factor = min(3.0, max(1.0, dur / 1.5))
+        pen = f.get('severity', 3) * 6 * dur_factor
         per_dim[d] = max(0.0, per_dim[d] - pen)
         if f.get('severity', 3) >= 4:
             hard.append(f['type'])
@@ -427,7 +441,9 @@ def score_findings(findings, t10):
         per_dim['semantic'] = min(per_dim['semantic'], (np.mean(scores) / 5) * 100)
         if min(scores) <= 2:
             hard.append('T10_misalignment')
-    total = round(float(np.mean(list(per_dim.values()))), 1)
+    # 总分 = 0.5×均值 + 0.5×最差维度：单一维度重伤不能被其余三维平均回「合格」
+    vals = list(per_dim.values())
+    total = round(0.5 * float(np.mean(vals)) + 0.5 * float(np.min(vals)), 1)
     return {'per_dim': {k: round(v, 1) for k, v in per_dim.items()},
             'hard_fails': sorted(set(hard)), 'total': total}
 
@@ -502,25 +518,15 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
     timing['s4_fuse_s'] = round(time.time() - t0, 2)
 
     rubric = []
-    frames = None
+    t10 = []
     if use_vlm:
+        from concurrent.futures import ThreadPoolExecutor
         t0 = time.time()
-        rubric = make_rubric(meta)
+        rubric = make_rubric(meta)               # rubric 先行，其余裁决都要引用它
         vlm_calls += 1
         frames, ffps = read_film_frames(film)
-        # 候选窗裁决
-        for w in wins:
-            ctx = f'fused anomaly score {w["score"]} (soft signals)'
-            v = vlm_window_verdict(frames, ffps, w, meta, rubric, ctx)
-            vlm_calls += 1
-            if v.get('verdict') == 'defect':
-                findings.append(dict(type='vlm_defect', start_s=w['start_s'],
-                                     end_s=w['end_s'],
-                                     severity=int(v.get('severity', 3)),
-                                     evidence=f'{v.get("type")}: {v.get("reason", "")}'[:200],
-                                     confidence=float(v.get('confidence', 0.6)),
-                                     verdict_by='vlm'))
-        # 主体探针候选裁决（T5 缺失 / T7 变形 / T8 漂移 —— 像素证据不充分的都走这里）
+
+        # 主体探针候选映射（T5 缺失 / T7 变形 / T8 漂移 —— 像素证据不充分的都走这里）
         CAND_MAP = {
             'T5_out_of_frame_candidate': ('T5_out_of_frame',
                 'subject "{subject}" not detected in this window of shot {shot} '
@@ -538,37 +544,62 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                 '({signal}) — identity/appearance change (e.g. object morphs, '
                 'clothing/color swap), or normal lighting change?'),
         }
-        for c in sub_info.get('candidates', []):
+
+        def judge_window(w):
+            ctx = f'fused anomaly score {w["score"]} (soft signals)'
+            v = vlm_window_verdict(frames, ffps, w, meta, rubric, ctx)
+            if v.get('verdict') == 'defect':
+                return dict(type='vlm_defect', start_s=w['start_s'], end_s=w['end_s'],
+                            severity=int(v.get('severity', 3)),
+                            evidence=f'{v.get("type")}: {v.get("reason", "")}'[:200],
+                            confidence=float(v.get('confidence', 0.6)), verdict_by='vlm')
+
+        def judge_candidate(c):
             ftype, tpl = CAND_MAP[c['type']]
             win = {'start_s': c['start_s'], 'end_s': max(c['end_s'], c['start_s'] + 0.5)}
             ctx = tpl.format(**{k: c.get(k, '') for k in ('subject', 'shot', 'signal')})
             v = vlm_window_verdict(frames, ffps, win, meta, rubric, ctx)
-            vlm_calls += 1
             if v.get('verdict') == 'defect':
-                findings.append(dict(type=ftype, start_s=c['start_s'],
-                                     end_s=c['end_s'],
-                                     severity=int(v.get('severity', 3)),
-                                     evidence=f'{c["subject"]} (shot{c["shot"]}, '
-                                              f'{c.get("signal", "missing")}): '
-                                              f'{v.get("reason", "")}'[:220],
-                                     confidence=float(v.get('confidence', 0.6)),
-                                     verdict_by='vlm'))
-        timing['s4_vlm_s'] = round(time.time() - t0, 2)
+                return dict(type=ftype, start_s=c['start_s'], end_s=c['end_s'],
+                            severity=int(v.get('severity', 3)),
+                            evidence=f'{c["subject"]}（分镜{c["shot"]}，'
+                                     f'{c.get("signal", "检测缺失")}）：'
+                                     f'{v.get("reason", "")}'[:220],
+                            confidence=float(v.get('confidence', 0.6)), verdict_by='vlm')
 
-    # S5 T10 alignment per shot
-    t10 = []
-    if use_vlm:
-        t0 = time.time()
-        if frames is None:
-            frames, ffps = read_film_frames(film)
-        for k, s in enumerate(meta['shots']):
-            if k >= len(spans):
-                break
+        def judge_t10(k_s):
+            k, s = k_s
             r = vlm_t10_alignment(frames, ffps, spans[k], s, rubric)
-            vlm_calls += 1
-            t10.append({'shot_id': s['shot_id'], **{kk: r.get(kk) for kk in
-                                                    ('score', 'missing', 'reason')}})
-        timing['s5_t10_s'] = round(time.time() - t0, 2)
+            return {'shot_id': s['shot_id'],
+                    **{kk: r.get(kk) for kk in ('score', 'missing', 'reason')}}
+
+        T10_VOTES = 3        # Bedrock 图像输入非严格确定，边界 2/3 分会翻转 → 三票取中位
+
+        # 除 rubric 外全部 VLM 调用并行（Bedrock 侧无依赖）
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            fut_wins = [pool.submit(judge_window, w) for w in wins]
+            fut_cands = [pool.submit(judge_candidate, c)
+                         for c in sub_info.get('candidates', [])]
+            fut_t10 = [(k, [pool.submit(judge_t10, (k, s)) for _ in range(T10_VOTES)])
+                       for k, s in enumerate(meta['shots']) if k < len(spans)]
+            for f in fut_wins + fut_cands:
+                vlm_calls += 1
+                r = f.result()
+                if r:
+                    findings.append(r)
+            for k, futs in fut_t10:
+                votes = [f.result() for f in futs]
+                vlm_calls += len(votes)
+                scored = sorted([v for v in votes if v.get('score')],
+                                key=lambda v: v['score'])
+                if scored:
+                    med = scored[len(scored) // 2]
+                    med['votes'] = [v.get('score') for v in votes]
+                    t10.append(med)
+                else:
+                    t10.append(votes[0])
+        t10.sort(key=lambda x: x['shot_id'])
+        timing['s4_vlm_s'] = round(time.time() - t0, 2)
 
     timing['total_s'] = round(time.time() - t_all, 2)
     timing['vlm_calls'] = vlm_calls

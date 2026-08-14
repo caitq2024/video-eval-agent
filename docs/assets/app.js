@@ -7,8 +7,8 @@ const TYPE_ZH = {
 };
 const STAGE_ZH = {
   t0_gate_s: 'T0 文件gate', s1_scan_s: 'S1 全帧扫描', s2_detect_s: 'S2 直判',
-  s3_probes_s: 'S3 主体探针', s4_fuse_s: 'S4 信号融合', s4_vlm_s: 'S4 VLM裁决',
-  s5_t10_s: 'S5 语义对齐',
+  s3_probes_s: 'S3 主体探针', s4_fuse_s: 'S4 信号融合',
+  s4_vlm_s: 'S4/S5 VLM并行裁决(含T10)', s5_t10_s: 'S5 语义对齐',
 };
 const STAGE_COLOR = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#9085e9', '#e66767'];
 
