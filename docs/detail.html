@@ -79,6 +79,13 @@ loadData().then(data => {
       video.currentTime = t; video.play().catch(() => {});
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }));
+    (e.vlm_rejected_by_tracker || []).forEach(r => {
+      const n = el('div', 'note');
+      n.style.marginTop = '8px';
+      n.textContent = `🛡 已拦截一条 VLM 误报（${r.window[0]}–${r.window[1]}s）：` +
+        `"${r.vlm_claim}" — ${r.rejected_because}`;
+      fc.appendChild(n);
+    });
     main.appendChild(fc);
 
     // T10 对齐

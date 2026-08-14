@@ -350,7 +350,10 @@ def subject_probes(film, meta, model, spans, fps, device):
                             break
                     else:
                         run = 0
-    return findings, {'candidates': cand, 'track_rates': track_rates}
+    # 逐子采样帧的主体在场轨迹（供 VLM 裁决交叉验证：像素证据优先于 VLM 印象）
+    presence = {s: [b is not None for b in dets[s]] for s in subjects}
+    return findings, {'candidates': cand, 'track_rates': track_rates,
+                      'presence': presence, 'sub_fps': sub_fps}
 
 
 # ---------------------------------------------------------------- S4/S5 VLM
@@ -519,6 +522,7 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
 
     rubric = []
     t10 = []
+    vlm_rejected = []
     if use_vlm:
         from concurrent.futures import ThreadPoolExecutor
         t0 = time.time()
@@ -545,10 +549,42 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                 'clothing/color swap), or normal lighting change?'),
         }
 
+        presence = sub_info.get('presence', {})
+        p_sub_fps = sub_info.get('sub_fps')
+
+        def window_presence(w):
+            """窗口内各主体的跟踪检出率（像素证据，用于约束/否决 VLM 印象）。"""
+            if not presence or not p_sub_fps:
+                return {}
+            lo = max(0, int(w['start_s'] * p_sub_fps))
+            hi = max(lo + 1, int(w['end_s'] * p_sub_fps))
+            return {s: sum(arr[lo:hi]) / max(1, len(arr[lo:hi]))
+                    for s, arr in presence.items() if arr[lo:hi]}
+
         def judge_window(w):
-            ctx = f'fused anomaly score {w["score"]} (soft signals)'
+            wp = window_presence(w)
+            ctx = f'fused anomaly score {w["score"]} (soft signals).'
+            if wp:
+                ctx += (' Object-tracker detection rate in this window: '
+                        + ', '.join(f'"{s}" {r * 100:.0f}%' for s, r in wp.items())
+                        + '. A subject at ~100% IS present in every frame — do NOT '
+                          'claim it disappeared or went missing.')
             v = vlm_window_verdict(frames, ffps, w, meta, rubric, ctx)
             if v.get('verdict') == 'defect':
+                # 交叉否决：VLM 声称主体消失，但单实例主体跟踪检出率满格 → 幻觉，拒绝
+                claim = (str(v.get('type', '')) + str(v.get('reason', ''))).lower()
+                vanish_kw = ['消失', '不见', 'disappear', 'vanish', 'missing',
+                             'absent', 'discontinu']
+                singular = {s: r for s, r in wp.items()
+                            if s.lower().startswith(('a ', 'an '))}
+                if any(k in claim for k in vanish_kw) and singular and \
+                        min(singular.values()) >= 0.95:
+                    vlm_rejected.append(dict(
+                        window=[w['start_s'], w['end_s']],
+                        vlm_claim=str(v.get('reason', ''))[:150],
+                        rejected_because='跟踪器证据否决：窗口内单实例主体检出率 '
+                        + ', '.join(f'{s}={r * 100:.0f}%' for s, r in singular.items())))
+                    return None
                 return dict(type='vlm_defect', start_s=w['start_s'], end_s=w['end_s'],
                             severity=int(v.get('severity', 3)),
                             evidence=f'{v.get("type")}: {v.get("reason", "")}'[:200],
@@ -613,6 +649,7 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
         'findings': findings, 't10_alignment': t10,
         'subject_probe': sub_info.get('track_rates', {}),
         'probe_candidates': sub_info.get('candidates', []),
+        'vlm_rejected_by_tracker': vlm_rejected,
         'rubric': rubric,
         'signals_preview': downsample_preview(sc['signals'], sc['cuts_frames'], n, fps),
         'scan_meta': {k: sc[k] for k in ('n_frames', 'fps', 'duration_s',
