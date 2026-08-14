@@ -1,40 +1,97 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>视频生成 Agent 质量评估平台</title>
-<style>
-  :root{--bg:#0d0d1a;--card:#16162a;--fg:#e8e8f0;--muted:#9898b0;--accent:#ff2ea6;--line:#2a2a44}
-  *{box-sizing:border-box;margin:0}
-  body{background:var(--bg);color:var(--fg);font-family:"PingFang SC","Microsoft YaHei",sans-serif;padding:32px;max-width:1200px;margin:0 auto}
-  h1{font-weight:300;font-size:32px;margin-bottom:6px}
-  .sub{color:var(--muted);margin-bottom:28px;font-size:14px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
-  .card{background:var(--card);border:1px solid var(--line);padding:18px;border-radius:6px}
-  .card h3{font-size:16px;font-weight:500;margin-bottom:8px}
-  .card .meta{color:var(--muted);font-size:13px;line-height:1.6}
-  .badge{display:inline-block;background:var(--accent);color:#fff;font-size:12px;padding:2px 8px;border-radius:3px;margin-right:6px}
-  .placeholder{border:1px dashed var(--line);color:var(--muted);text-align:center;padding:60px 20px;border-radius:6px;margin-top:24px}
-  a{color:var(--accent)}
-  footer{margin-top:40px;color:var(--muted);font-size:12px}
-</style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>视频生成 Agent × 质量评估平台</title>
+<link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
-<h1>视频生成 Agent 质量评估平台</h1>
-<div class="sub">导演分镜 → Wan2.1 / Wan2.2 生成 → 转场拼接 → 全帧探针 + Hybrid 裁决检测 · <a href="https://github.com/caitq2024/video-eval-agent">GitHub</a></div>
-<div id="app"><div class="placeholder">生成与评估数据准备中——wan_agent 管线产出 <code>docs/data/manifest.json</code> 后此处自动渲染 5 组 prompt × 2 模型的成片、缺陷时间轴与对比结论。</div></div>
+<div class="wrap">
+  <header class="site">
+    <h1>视频生成 Agent × 质量评估</h1>
+    <nav>
+      <a class="on" href="index.html">总览</a>
+      <a href="method.html">评估方法</a>
+      <a href="https://github.com/caitq2024/video-eval-agent">GitHub</a>
+    </nav>
+    <span class="sub">创意 → 导演分镜 → Wan2.1/2.2 生成 → 转场拼接 → 全帧探针 + Hybrid 裁决</span>
+  </header>
+
+  <div class="card">
+    <div class="pipeline-steps">
+      <span class="step">💡 一句话创意</span><span class="arr">→</span>
+      <span class="step">🎬 导演 Agent（Claude Sonnet 4.5）拆 3 分镜</span><span class="arr">→</span>
+      <span class="step">🎞 Wan2.1-1.3B / Wan2.2-5B 各生成 3×5s</span><span class="arr">→</span>
+      <span class="step">✂️ ffmpeg 按分镜转场拼接</span><span class="arr">→</span>
+      <span class="step">🔍 评估 Agent：全帧扫描 + 直判 + GroundingDINO + Claude 裁决</span>
+    </div>
+    <div class="grid cols3" id="stats" style="margin-top:14px"></div>
+  </div>
+
+  <h2>5 个创意 × 2 个模型</h2>
+  <div class="grid cols2" id="cards"></div>
+</div>
+<script src="assets/app.js"></script>
 <script>
-fetch('data/manifest.json').then(r=>r.ok?r.json():null).then(m=>{
-  if(!m||!m.videos||!m.videos.length) return;
-  const app=document.getElementById('app');
-  app.innerHTML='<div class="grid">'+m.videos.map(v=>`
-    <div class="card">
-      <video src="assets/videos/${v.file}" controls preload="metadata" style="width:100%;border-radius:4px;background:#000"></video>
-      <h3 style="margin-top:10px">${v.title||v.file}</h3>
-      <div class="meta"><span class="badge">${v.model}</span>缺陷 ${v.findings_count??'?'} 处 · 总分 ${v.score??'—'}</div>
-    </div>`).join('')+'</div>';
-}).catch(()=>{});
+loadData().then(data => {
+  // 顶部统计
+  let films = 0, clips = 0, evals = 0, evalTime = 0, genTime = 0, vlmCalls = 0;
+  data.prompts.forEach(p => {
+    for (const mk of data.models) {
+      const g = p.generation[mk] || {};
+      for (const k in g) { clips += g[k].ok ? 1 : 0; genTime += g[k].gen_wall_s || 0; }
+      if (p.films[mk]) films++;
+      const e = p.evals[mk];
+      if (e) { evals++; evalTime += e.timing.total_s; vlmCalls += e.timing.vlm_calls || 0; }
+    }
+  });
+  const stats = [
+    [films, '拼接成片'], [clips, '生成分镜 clip'],
+    [(genTime / 60).toFixed(0) + ' min', '生成总耗时(GPU)'],
+    [evals ? (evalTime / evals).toFixed(1) + ' s' : '—', '评估耗时/成片(均值)'],
+    [vlmCalls, 'VLM 裁决调用'],
+  ];
+  const st = document.getElementById('stats');
+  stats.forEach(([v, k]) => {
+    const d = el('div', 'stat');
+    d.appendChild(el('div', 'v', String(v)));
+    d.appendChild(el('div', 'k', k));
+    st.appendChild(d);
+  });
+  // 卡片
+  const cards = document.getElementById('cards');
+  data.prompts.forEach(p => {
+    const c = el('div', 'card pcard');
+    c.appendChild(el('div', 'sub', `${p.id} · ${p.title_zh || ''}`));
+    c.appendChild(el('div', 'idea', p.idea));
+    const ms = el('div', 'models');
+    data.models.forEach(mk => {
+      const e = p.evals[mk];
+      const a = el('a', 'mtile');
+      a.href = `detail.html?pid=${p.id}&model=${mk}`;
+      const v = el('video');
+      v.src = videoSrc(p.id, mk, 'film.mp4'); v.muted = true; v.loop = true;
+      v.preload = 'metadata';
+      v.onmouseenter = () => v.play().catch(() => {});
+      v.onmouseleave = () => { v.pause(); };
+      a.appendChild(v);
+      const row = el('div', 'row');
+      row.appendChild(el('span', 'name', data.model_info[mk].label));
+      row.appendChild(scoreBadge(e ? e.scores.total : null));
+      a.appendChild(row);
+      ms.appendChild(a);
+    });
+    c.appendChild(ms);
+    const cmp = el('div');
+    cmp.style.marginTop = '10px';
+    const link = el('a', '', '⇆ 并排对比两个模型');
+    link.href = `compare.html?pid=${p.id}`;
+    cmp.appendChild(link);
+    c.appendChild(cmp);
+    cards.appendChild(c);
+  });
+});
 </script>
-<footer>hybrid video quality evaluation · taxonomy 见仓库 taxonomy/TAXONOMY.md</footer>
 </body>
 </html>

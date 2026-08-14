@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>成片详情 · 视频质量评估</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="site">
+    <h1><a href="index.html" style="color:inherit">视频生成 Agent × 质量评估</a></h1>
+    <nav><a href="index.html">总览</a><a href="method.html">评估方法</a><a id="cmpLink" href="#">模型对比</a></nav>
+  </header>
+  <div id="main"></div>
+</div>
+<script src="assets/app.js"></script>
+<script src="assets/timeline.js"></script>
+<script>
+loadData().then(data => {
+  const pid = q('pid'), mk = q('model') || 'wan2.1';
+  const p = data.prompts.find(x => x.id === pid);
+  document.getElementById('cmpLink').href = `compare.html?pid=${pid}`;
+  const main = document.getElementById('main');
+  if (!p) { main.textContent = '未找到该 prompt'; return; }
+  const e = p.evals[mk];
+  document.title = `${p.title_zh || p.id} · ${mk}`;
+
+  // 头部
+  const head = el('div', 'card');
+  const h = el('h2', '', `${p.id} ${p.title_zh || ''} · ${data.model_info[mk].label}`);
+  h.style.margin = '0 0 6px';
+  head.appendChild(h);
+  head.appendChild(el('div', 'sub', `创意：${p.idea}`));
+  if (e) {
+    const row = el('div', 'kv');
+    const b = el('span'); b.style.border = 'none'; b.style.padding = '0';
+    b.appendChild(scoreBadge(e.scores.total)); row.appendChild(b);
+    Object.entries(e.scores.per_dim).forEach(([k, v]) => {
+      const zh = { temporal: '时序', structural: '结构', subject: '主体', semantic: '语义' }[k] || k;
+      row.appendChild(el('span', '', `${zh} ${v}`));
+    });
+    if (e.scores.hard_fails.length)
+      row.appendChild(el('span', '', '硬失败: ' + e.scores.hard_fails.map(t => TYPE_ZH[t] || t).join(', ')));
+    head.appendChild(row);
+  }
+  main.appendChild(head);
+
+  // 成片 + 时间轴
+  const g2 = el('div', 'grid cols2'); g2.style.marginTop = '16px';
+  const vc = el('div', 'card');
+  vc.appendChild(el('h3', '', '拼接成片'));
+  const video = el('video', 'player');
+  video.controls = true; video.src = videoSrc(pid, mk, 'film.mp4');
+  vc.appendChild(video);
+  if (e) {
+    const tn = el('div', 'note');
+    tn.style.marginTop = '8px';
+    tn.textContent = `时长 ${e.scan_meta.duration_s}s · ${e.scan_meta.n_frames} 帧 @${e.scan_meta.fps}fps · 转场 ` +
+      (e.transitions || []).map(t => `${t.type}@${t.start_s}s`).join(', ');
+    vc.appendChild(tn);
+  }
+  g2.appendChild(vc);
+
+  const tc = el('div', 'card');
+  tc.appendChild(el('h3', '', '全帧信号时间轴（点击跳转视频）'));
+  if (e) {
+    const tl = el('div'); tc.appendChild(tl);
+    drawTimeline(tl, e, video);
+  } else tc.appendChild(el('div', 'note', '尚未评估'));
+  g2.appendChild(tc);
+  main.appendChild(g2);
+
+  if (e) {
+    // findings
+    const fc = el('div', 'card'); fc.style.marginTop = '16px';
+    fc.appendChild(el('h3', '', `检出缺陷（${e.findings.length}）`));
+    fc.appendChild(findingsTable(e.findings, t => {
+      video.currentTime = t; video.play().catch(() => {});
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }));
+    main.appendChild(fc);
+
+    // T10 对齐
+    const ac = el('div', 'card'); ac.style.marginTop = '16px';
+    ac.appendChild(el('h3', '', 'T10 语义对齐（分镜 × intended prompt）'));
+    const at = el('table');
+    const th = el('tr');
+    ['分镜', '得分/5', '缺失要素', 'Claude 评语'].forEach(x => th.appendChild(el('th', '', x)));
+    at.appendChild(th);
+    (e.t10_alignment || []).forEach(t => {
+      const tr = el('tr');
+      tr.appendChild(el('td', '', 'Shot ' + t.shot_id));
+      const sc = el('td', 'num');
+      sc.appendChild(el('span', `sev sev${t.score >= 4 ? 1 : t.score >= 3 ? 3 : 5}`,
+        t.score === null || t.score === undefined ? '—' : String(t.score)));
+      tr.appendChild(sc);
+      tr.appendChild(el('td', '', (t.missing || []).join('；')));
+      tr.appendChild(el('td', '', t.reason || ''));
+      at.appendChild(tr);
+    });
+    ac.appendChild(at);
+    main.appendChild(ac);
+
+    // 评估耗时
+    const tmc = el('div', 'card'); tmc.style.marginTop = '16px';
+    tmc.appendChild(el('h3', '', `评估 Agent 运行时长：${fmtS(e.timing.total_s)}（含 ${e.timing.vlm_calls} 次 VLM 调用）`));
+    timingBar(e.timing, tmc);
+    const note = el('div', 'note');
+    note.style.marginTop = '8px';
+    note.textContent = `全帧扫描吞吐 ${e.scan_meta.realtime_factor}× 实时（GPU 计算 ${e.scan_meta.compute_s}s）；` +
+      `主体跟踪率 ` + Object.entries(e.subject_probe || {}).map(([k, v]) => `${k}=${v}`).join(', ');
+    tmc.appendChild(note);
+    main.appendChild(tmc);
+
+    // rubric
+    if ((e.rubric || []).length) {
+      const rc = el('div', 'card'); rc.style.marginTop = '16px';
+      rc.appendChild(el('h3', '', '预注册评分标准（rubric 先行，看片前生成）'));
+      const ul = el('ul', 'rubric');
+      e.rubric.forEach(r => ul.appendChild(el('li', '', r)));
+      rc.appendChild(ul);
+      main.appendChild(rc);
+    }
+  }
+
+  // 分镜
+  const sc2 = el('div', 'card'); sc2.style.marginTop = '16px';
+  sc2.appendChild(el('h3', '', '导演分镜 + 各段 clip'));
+  const sg = el('div', 'grid cols3');
+  p.shots.forEach(s => {
+    const d = el('div', 'shot');
+    const v = el('video'); v.controls = true; v.preload = 'metadata';
+    v.src = videoSrc(pid, mk, `shot${s.shot_id}.mp4`);
+    d.appendChild(v);
+    const gen = ((p.generation[mk] || {})[`shot${s.shot_id}`]) || {};
+    d.appendChild(el('div', 'meta',
+      `Shot ${s.shot_id} · ${s.camera} · motion:${s.motion_level} · ` +
+      `转场:${s.transition_to_next || '—'} · 生成 ${fmtS(gen.gen_wall_s)}${gen.ok === false ? ' ⚠ 失败' : ''}`));
+    d.appendChild(el('div', 'p', s.wan_prompt));
+    const kv = el('div', 'kv');
+    (s.expected_subjects || []).forEach(x => kv.appendChild(el('span', '', '🎯 ' + x)));
+    d.appendChild(kv);
+    sg.appendChild(d);
+  });
+  sc2.appendChild(sg);
+  main.appendChild(sc2);
+});
+</script>
+</body>
+</html>

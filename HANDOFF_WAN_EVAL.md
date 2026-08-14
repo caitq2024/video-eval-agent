@@ -1,6 +1,6 @@
 # 交接文档：Wan 视频生成 Agent + 质量评估平台
 
-写给 GPU 机器（8×A100 内部机器）上的 Claude Code。日期 2026-08-14。
+写给 GPU 机器（18.237.153.148, 8×A100）上的 Claude Code。日期 2026-08-14。
 本文档由 CPU 机器上的会话生成，包含全部必要上下文。**先通读再动手。**
 
 ## 0. 一句话背景
@@ -20,7 +20,7 @@
 | HF/torch 缓存 | `export HF_HOME=/home/ec2-user/hf_cache TORCH_HOME=/home/ec2-user/torch_cache`（放本地盘，别放 EFS） |
 | ⚠ GPU 占用 | 8 张卡经常被用户自己的训练占到 ~38GB/40GB。**动手前 `nvidia-smi`**，挑空闲卡 `CUDA_VISIBLE_DEVICES=N`；Wan2.2-A14B 需要整卡，必要时和用户确认哪张卡可用 |
 | Bedrock（us-west-2） | VLM 裁决用。可用模型：`us.amazon.nova-2-lite-v1:0`（便宜）、`global.anthropic.claude-sonnet-4-5-20250929-v1:0`（裁决质量高，实测 5/5 vs Nova 1/5）、`us.anthropic.claude-haiku-4-5-20251001-v1:0` |
-| GitHub | 仓库 **caitq2024/video-eval-agent**（见 §6） |
+| GitHub | 已登录 caitq2024（CPU 机器上）；仓库 **caitq2024/video-eval-agent**（本次创建，见 §6） |
 | EFS | 两台机器共享 `/home/ec2-user/efs`，所有代码/结果直接互通 |
 
 ## 2. 现有资产地图（`/home/ec2-user/efs/agent_evaluation/video_eval/`）

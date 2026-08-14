@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>评估方法 · 视频质量评估</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="site">
+    <h1><a href="index.html" style="color:inherit">视频生成 Agent × 质量评估</a></h1>
+    <nav><a href="index.html">总览</a><a class="on" href="method.html">评估方法</a>
+      <a href="https://github.com/caitq2024/video-eval-agent">GitHub</a></nav>
+  </header>
+
+  <div class="card">
+    <h2 style="margin-top:0">评估架构：探针定位 + Hybrid 裁决</h2>
+    <p class="sub">VANE-Bench 实测表明"把视频直接丢给多模态大模型"无法可靠检测细微时空异常。
+    我们的方案：<b>全帧探针扫描定位异常窗 → 像素证据充分的 detector 直判 → 证据不足的候选窗交
+    Claude+rubric 定向裁决</b>。合成缺陷视频上 10 类缺陷拦截 21/22（95%）、零误报；本平台展示的是
+    该管线对 <b>真实 Wan2.1/2.2 生成视频</b> 的检测结果。</p>
+    <div class="pipeline-steps">
+      <span class="step">T0 ffprobe gate</span><span class="arr">→</span>
+      <span class="step">S1 全帧信号扫描（亮度/帧差/闪烁/CLIP/光流warp，GPU 秒级）</span><span class="arr">→</span>
+      <span class="step">S2 直判（黑帧/冻结/闪烁/跳帧/意外切换，转场豁免）</span><span class="arr">→</span>
+      <span class="step">S3 GroundingDINO 主体探针（出界/变形/色相漂移）</span><span class="arr">→</span>
+      <span class="step">S4 信号融合 Top-K 候选窗 → Claude 定向裁决</span><span class="arr">→</span>
+      <span class="step">S5 T10 语义对齐（rubric 先行）</span>
+    </div>
+  </div>
+
+  <h2>10 类缺陷分类体系</h2>
+  <div class="card" style="overflow-x:auto">
+    <table>
+      <tr><th>#</th><th>错误类型</th><th>定义与典型表现</th><th>检测信号</th><th>拦截层</th><th>合成测试拦截</th></tr>
+      <tr><td>T0</td><td>文件/编码层故障</td><td>0 字节/截断/无法解码、时长帧率异常</td><td>ffprobe gate</td><td>直判</td><td>—</td></tr>
+      <tr><td>T1</td><td>跳帧/瞬移</td><td>丢帧导致内容瞬移、动作一帧一跳</td><td>光流 warp 残差孤立尖峰、CLIP 跳变</td><td>直判 + VLM 定向</td><td>2/2</td></tr>
+      <tr><td>T2</td><td>时序闪烁</td><td>单帧亮度/颜色突变</td><td>亮度尖峰（全帧率）</td><td>直判</td><td>2/2</td></tr>
+      <tr><td>T3</td><td>冻结/伪静态</td><td>画面突然静止；全片近静态"换稳定性"</td><td>帧差≈0 连续段 + 分镜运动先验</td><td>直判</td><td>2/2</td></tr>
+      <tr><td>T4</td><td>意外场景切换</td><td>单镜头任务中出现硬切</td><td>HSV 帧差 &gt;27 + 分镜转场豁免</td><td>直判 + 任务 rubric</td><td>2/2</td></tr>
+      <tr><td>T5</td><td>主体出界/裁切</td><td>主体被裁切或无理由离开画面</td><td>GroundingDINO 跟踪缺失窗</td><td>候选 → VLM 裁决（区分有意出画/特写）</td><td>2/2</td></tr>
+      <tr><td>T6</td><td>黑帧/坏帧</td><td>全黑、纯色、乱码噪声帧</td><td>亮度阈值</td><td>直判</td><td>2/2</td></tr>
+      <tr><td>T7</td><td>主体变形</td><td>解剖学不可能的形变、橡皮化</td><td>bbox 纵横比持续偏移（motion 先验放宽）</td><td>直判 + VLM 确认</td><td>2/2</td></tr>
+      <tr><td>T8</td><td>身份漂移</td><td>换脸、衣服变色、狗渐变成猫</td><td>主体 crop 色相直方图漂移（DINOv2 对颜色不敏感，勿用）</td><td>直判</td><td>2/2</td></tr>
+      <tr><td>T9</td><td>物体凭空消失</td><td>次要物体无因果消失</td><td>GroundingDINO 实例关联轨迹中断</td><td>升级项（需 SAM2 级跟踪）</td><td>2/2 定位</td></tr>
+      <tr><td>T10</td><td>语义不符</td><td>内容缺失/错配 prompt</td><td>8 帧均匀采样 + Claude 对齐评分</td><td>全局 VLM 层</td><td>2/2</td></tr>
+    </table>
+  </div>
+
+  <h2>VLM 裁决三原则（E7 实测）</h2>
+  <div class="card">
+    <ol class="rubric">
+      <li><b>像素证据充分的直判、不问 VLM</b> —— 黑帧/冻结/硬切/闪烁直接给结论，快且稳定。</li>
+      <li><b>问 VLM 要问具体问题</b> —— 带 8 连续帧拼图 + 触发信号摘要 + intended prompt，问
+        "主体逐格是否连续""出画是否有意"，而不是"这视频有没有问题"。</li>
+      <li><b>rubric 先行</b> —— 看视频前先由 judge 从 prompt 生成 3-6 条硬标准附在裁决 prompt 里，
+        防止被输出内容"带着走"。消融：Nova 1/5 → Claude 4/5 → Claude+rubric <b>5/5</b>。</li>
+    </ol>
+  </div>
+
+  <h2>真实生成视频上的阈值再校准</h2>
+  <div class="card">
+    <p class="sub">直判阈值最初在 640×360 合成视频上校准（正常 warp ≤3.1、帧差底噪 &lt;8）。
+    Wan 真实生成视频纹理噪声与运动幅度大得多：wan2.1 832×480 实测 warp 残差<b>中位数即 5.3</b>、
+    高运动镜头峰值 80+。为此做了三处修正：</p>
+    <ol class="rubric">
+      <li><b>T1 跳帧改"孤立尖峰"判定</b>：warp &gt; max(6.0, 3×局部中位数) 且邻帧回落 —— 持续高
+        warp 是运动，不是跳帧；</li>
+      <li><b>T7 变形按 motion_level 放宽</b>（low ×1.0 / medium ×1.6 / high ×2.2）且要求持续
+        3 个子采样帧 —— 活体主体姿态变化会自然改变 bbox 纵横比；</li>
+      <li><b>T3 冻结引入导演分镜先验</b>：camera=static 且 motion=low 的镜头判冻结需 2 倍时长。</li>
+    </ol>
+    <p class="sub">导演分镜 JSON 同时是评估输入：计划转场点豁免 T4/T1/T2，expected_subjects
+    作为 GroundingDINO 的开放词汇跟踪词，motion_level/camera 作为 T3/T7 先验。
+    <b>生成侧元数据反哺评估侧，是这个闭环的核心设计。</b></p>
+  </div>
+</div>
+</body>
+</html>

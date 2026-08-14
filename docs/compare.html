@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型对比 · 视频质量评估</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="site">
+    <h1><a href="index.html" style="color:inherit">视频生成 Agent × 质量评估</a></h1>
+    <nav><a href="index.html">总览</a><a href="method.html">评估方法</a></nav>
+  </header>
+  <div id="main"></div>
+</div>
+<script src="assets/app.js"></script>
+<script src="assets/timeline.js"></script>
+<script>
+loadData().then(data => {
+  const pid = q('pid');
+  const p = data.prompts.find(x => x.id === pid);
+  const main = document.getElementById('main');
+  if (!p) { main.textContent = '未找到该 prompt'; return; }
+  document.title = `${p.title_zh || p.id} · 模型对比`;
+  const head = el('div', 'card');
+  const h = el('h2', '', `${p.id} ${p.title_zh || ''} · Wan2.1 vs Wan2.2`);
+  h.style.margin = '0 0 6px'; head.appendChild(h);
+  head.appendChild(el('div', 'sub', `创意：${p.idea}`));
+  main.appendChild(head);
+
+  const g = el('div', 'grid cols2'); g.style.marginTop = '16px';
+  data.models.forEach(mk => {
+    const e = p.evals[mk];
+    const c = el('div', 'card');
+    const t = el('h3', '', data.model_info[mk].label); t.style.marginTop = '0';
+    c.appendChild(t);
+    const video = el('video', 'player');
+    video.controls = true; video.src = videoSrc(pid, mk, 'film.mp4');
+    c.appendChild(video);
+    if (e) {
+      const row = el('div', 'kv');
+      const b = el('span'); b.style.cssText = 'border:none;padding:0';
+      b.appendChild(scoreBadge(e.scores.total)); row.appendChild(b);
+      Object.entries(e.scores.per_dim).forEach(([k, v]) => {
+        const zh = { temporal: '时序', structural: '结构', subject: '主体', semantic: '语义' }[k] || k;
+        row.appendChild(el('span', '', `${zh} ${v}`));
+      });
+      row.appendChild(el('span', '', `评估 ${fmtS(e.timing.total_s)}`));
+      c.appendChild(row);
+      const tl = el('div'); tl.style.marginTop = '12px';
+      c.appendChild(tl); drawTimeline(tl, e, video);
+      c.appendChild(el('h3', '', `缺陷（${e.findings.length}）`));
+      c.appendChild(findingsTable(e.findings, s => { video.currentTime = s; video.play().catch(() => {}); }));
+      const t10 = el('div', 'note');
+      t10.style.marginTop = '10px';
+      t10.textContent = 'T10 对齐: ' + (e.t10_alignment || []).map(x => `shot${x.shot_id}=${x.score}/5`).join(' · ');
+      c.appendChild(t10);
+    } else c.appendChild(el('div', 'note', '尚未评估'));
+    const dl = el('a', '', '→ 查看详情');
+    dl.href = `detail.html?pid=${pid}&model=${mk}`;
+    dl.style.cssText = 'display:inline-block;margin-top:10px';
+    c.appendChild(dl);
+    g.appendChild(c);
+  });
+  main.appendChild(g);
+
+  // 结论区
+  const e1 = p.evals['wan2.1'], e2 = p.evals['wan2.2'];
+  if (e1 && e2) {
+    const cc = el('div', 'card'); cc.style.marginTop = '16px';
+    cc.appendChild(el('h3', '', '同 prompt 对比'));
+    const tb = el('table');
+    const th = el('tr');
+    ['指标', 'Wan2.1-1.3B', 'Wan2.2-5B'].forEach(x => th.appendChild(el('th', '', x)));
+    tb.appendChild(th);
+    const rows = [
+      ['总分', e1.scores.total, e2.scores.total],
+      ['缺陷数', e1.findings.length, e2.findings.length],
+      ['硬失败', e1.scores.hard_fails.join(',') || '无', e2.scores.hard_fails.join(',') || '无'],
+      ['语义对齐均分', avg(e1.t10_alignment), avg(e2.t10_alignment)],
+      ['评估耗时', fmtS(e1.timing.total_s), fmtS(e2.timing.total_s)],
+    ];
+    rows.forEach(([k, a, b]) => {
+      const tr = el('tr');
+      tr.appendChild(el('td', '', k));
+      tr.appendChild(el('td', 'num', String(a)));
+      tr.appendChild(el('td', 'num', String(b)));
+      tb.appendChild(tr);
+    });
+    cc.appendChild(tb);
+    main.appendChild(cc);
+  }
+  function avg(t) {
+    const s = (t || []).map(x => x.score).filter(Boolean);
+    return s.length ? (s.reduce((a, b) => a + b, 0) / s.length).toFixed(1) + '/5' : '—';
+  }
+});
+</script>
+</body>
+</html>
