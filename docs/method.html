@@ -11,6 +11,7 @@
   <header class="site">
     <h1><a href="index.html" style="color:inherit">视频生成 Agent × 质量评估</a></h1>
     <nav><a href="index.html">总览</a><a class="on" href="method.html">评估方法</a>
+      <a href="demo.html">现场演示</a>
       <a href="https://github.com/caitq2024/video-eval-agent">GitHub</a></nav>
   </header>
 
@@ -45,7 +46,18 @@
       <tr><td>T8</td><td>身份漂移</td><td>换脸、衣服变色、狗渐变成猫</td><td>主体 crop 色相直方图漂移（DINOv2 对颜色不敏感，勿用）</td><td>直判</td><td>2/2</td></tr>
       <tr><td>T9</td><td>物体凭空消失</td><td>次要物体无因果消失</td><td>GroundingDINO 实例关联轨迹中断</td><td>升级项（需 SAM2 级跟踪）</td><td>2/2 定位</td></tr>
       <tr><td>T10</td><td>语义不符</td><td>内容缺失/错配 prompt</td><td>8 帧均匀采样 + Claude 对齐评分</td><td>全局 VLM 层</td><td>2/2</td></tr>
+      <tr><td>T11</td><td>局部时序不连贯 <span class="tag vlm">新增</span></td>
+        <td>相邻 1-2 帧内画面局部对象突变：肢体瞬间换位、道具单帧变形、物体小幅瞬移，画面其余部分正常</td>
+        <td>warp 残差 8×8 分块 max（全帧均值会空间稀释局部信号）+ 主体轨迹动力学（bbox IoU 骤降/中心瞬移）</td>
+        <td>局部信号候选 → 连续 4 帧区域放大裁剪并排 → VLM 确认（双重验证）</td><td>提案落地中</td></tr>
     </table>
+  </div>
+
+  <h2>各类缺陷示例（合成注入黄金集，评估管线即在此集上校准出 95% 拦截率）</h2>
+  <div class="card">
+    <p class="sub">以下为拦截率测试用的合成缺陷视频（每类 2 变体，此处展示变体 A）：橙色笑脸球沿正弦轨迹平移、
+    镜头缓慢右摇的 8 秒"干净"底片，按类注入单一缺陷，缺陷时间窗有精确 ground truth。</p>
+    <div class="grid cols3" id="taxGallery"></div>
   </div>
 
   <h2>VLM 裁决三原则（E7 实测）</h2>
@@ -75,6 +87,45 @@
     作为 GroundingDINO 的开放词汇跟踪词，motion_level/camera 作为 T3/T7 先验。
     <b>生成侧元数据反哺评估侧，是这个闭环的核心设计。</b></p>
   </div>
+
+  <h2>裁决与验证策略</h2>
+  <div class="card">
+    <ol class="rubric">
+      <li><b>裁决模型</b>：Claude Opus 4-8（Bedrock），rubric 先行 + 三票中位（T10）。</li>
+      <li><b>主体消失双重验证</b>：GroundingDINO 跟踪为主判 —— VLM 声称主体消失时，
+        单实例主体跟踪检出率 ≥95% 则否决 VLM（防幻觉）；跟踪器同窗口确有缺失才置信扣分
+        （findings 中标注<span class="tag dual" style="margin:0 4px">双重验证</span>）；
+        多实例主体（如"两名击剑手"）跟踪器只能证明"至少一个在场"，保留 VLM 单票但降置信。</li>
+      <li><b>T11 证据推到脸上</b>：局部候选不给整帧拼图（Artifact-Bench 实测 19 个多模态大模型
+        裸看整帧伪影接近随机），改为同一区域连续 4 帧的放大裁剪并排图。</li>
+    </ol>
+  </div>
 </div>
+<script src="assets/app.js"></script>
+<script>
+const TAX = [
+  ['T1 跳帧/瞬移', 'tax_jump_A', '3.0s 处跳过 12 帧，球瞬移', '2.94–3.06s'],
+  ['T2 时序闪烁', 'tax_flicker_A', '2.1 / 4.5 / 6.2s 三个单帧亮闪', '2.06s, 4.50s, 6.19s'],
+  ['T3 冻结', 'tax_freeze_A', '5.0s 起画面冻结 0.75s（重复帧）', '5.0–5.75s'],
+  ['T4 意外切换', 'tax_cut_A', '4.0–4.5s 切入 "WRONG SCENE" 错误场景', '4.0–4.5s'],
+  ['T5 主体出界/裁切', 'tax_crop_A', '3.4–4.6s 球漂出右边界后返回', '3.4–4.6s'],
+  ['T6 黑帧/坏帧', 'tax_black_A', '2.5s 两帧全黑 + 6.0s 一帧噪声', '2.5s, 6.0s'],
+  ['T7 主体变形', 'tax_deform_A', '3.5–4.1s 球被压扁（纵横比突变）', '3.5–4.1s'],
+  ['T8 身份漂移', 'tax_swap_A', '4.5s 起球永久变紫（色相漂移）', '4.5s 起'],
+  ['T9 物体凭空消失', 'tax_vanish_A', '绿方块（次要物体）5.0s 消失 0.5s 后回', '5.0–5.5s'],
+  ['T10 语义不符', 'tax_semantic_A', '画面内容与 intended prompt 不符', '全片'],
+  ['对照：clean', 'tax_clean', '无注入缺陷 —— 全信号低于门控下限，零误报', '—'],
+];
+const g = document.getElementById('taxGallery');
+TAX.forEach(([name, file, desc, win]) => {
+  const d = el('div', 'shot');
+  const v = el('video'); v.controls = true; v.preload = 'metadata'; v.loop = true;
+  v.src = `assets/videos/${file}.mp4`;
+  d.appendChild(v);
+  d.appendChild(el('div', 'meta', name + ' · 缺陷窗 ' + win));
+  d.appendChild(el('div', 'p', desc));
+  g.appendChild(d);
+});
+</script>
 </body>
 </html>

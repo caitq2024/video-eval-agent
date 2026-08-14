@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>现场演示 · 输入创意生成并审核</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .form { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-start; }
+  .form textarea {
+    flex: 1; min-width: 280px; min-height: 64px; background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 8px; color: var(--ink);
+    padding: 10px; font: inherit; resize: vertical;
+  }
+  .form select, .form label { background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--ink); padding: 9px 10px; font: inherit; }
+  .form button {
+    background: var(--s1); color: #fff; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: inherit; font-weight: 700; cursor: pointer;
+  }
+  .form button:disabled { opacity: .45; cursor: not-allowed; }
+  .stagebar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .stagebar .st { padding: 4px 12px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--muted); font-size: 13px; }
+  .stagebar .st.on { border-color: var(--s1); color: var(--s1); font-weight: 600; }
+  .stagebar .st.done { border-color: var(--good); color: var(--good); }
+  .banner { border: 1px solid var(--warning); border-radius: 8px; padding: 12px 14px;
+    color: var(--warning); margin-bottom: 16px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="site">
+    <h1><a href="index.html" style="color:inherit">视频生成 Agent × 质量评估</a></h1>
+    <nav><a href="index.html">总览</a><a href="method.html">评估方法</a><a class="on" href="demo.html">现场演示</a></nav>
+    <span class="sub">输入你的创意 → 导演拆分镜 → Wan 生成 → 质量评估 Agent 审核</span>
+  </header>
+  <div id="banner"></div>
+  <div class="card">
+    <div class="form">
+      <textarea id="idea" placeholder="输入一句话创意，例如：一只橘猫在雨后的屋顶上追一只蝴蝶，黄昏逆光"></textarea>
+      <select id="nshots"><option value="1">1 个分镜</option><option value="2">2 个分镜</option>
+        <option value="3" selected>3 个分镜</option></select>
+      <label><input type="checkbox" id="m22" checked> Wan2.2-5B</label>
+      <label><input type="checkbox" id="m21"> Wan2.1-1.3B</label>
+      <button id="go">生成并审核</button>
+    </div>
+    <div class="stagebar" id="stages" style="display:none">
+      <span class="st" data-s="queued">排队</span>
+      <span class="st" data-s="directing">导演拆分镜</span>
+      <span class="st" data-s="generating">Wan 生成</span>
+      <span class="st" data-s="stitching">转场拼接</span>
+      <span class="st" data-s="evaluating">质量评估</span>
+      <span class="st" data-s="done">完成</span>
+    </div>
+    <div class="note" id="detail" style="margin-top:8px"></div>
+  </div>
+  <div id="board"></div>
+  <div id="result"></div>
+</div>
+<script src="assets/app.js"></script>
+<script src="assets/timeline.js"></script>
+<script>
+const API = '';   // 同源（必须通过演示服务器访问本页）
+const ORDER = ['queued', 'directing', 'generating', 'stitching', 'evaluating', 'done'];
+if (location.protocol === 'https:') {
+  document.getElementById('banner').innerHTML =
+    '<div class="banner">⚠ 本页需要连接 GPU 演示服务器才能现场生成（GitHub Pages 是静态托管）。' +
+    '请通过演示服务器地址访问本页：<code>http://&lt;GPU机器IP&gt;:8008/demo.html</code>' +
+    '（启动方式见仓库 wan_agent/demo_server.py 顶部注释）。下方为只读展示。</div>';
+  document.getElementById('go').disabled = true;
+}
+
+let jobId = null, timer = null, shotsShown = false;
+
+document.getElementById('go').onclick = async () => {
+  const idea = document.getElementById('idea').value.trim();
+  if (!idea) { alert('请输入创意'); return; }
+  const models = [];
+  if (document.getElementById('m22').checked) models.push('wan2.2');
+  if (document.getElementById('m21').checked) models.push('wan2.1');
+  const r = await fetch(API + '/api/submit', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idea, n_shots: +document.getElementById('nshots').value, models }),
+  });
+  const d = await r.json();
+  if (d.error) { alert(d.error); return; }
+  jobId = d.job_id; shotsShown = false;
+  document.getElementById('go').disabled = true;
+  document.getElementById('stages').style.display = 'flex';
+  document.getElementById('board').textContent = '';
+  document.getElementById('result').textContent = '';
+  timer = setInterval(poll, 3000);
+};
+
+async function poll() {
+  const st = await (await fetch(`${API}/api/status/${jobId}`)).json();
+  const idx = ORDER.indexOf(st.stage);
+  document.querySelectorAll('.stagebar .st').forEach(e => {
+    const i = ORDER.indexOf(e.dataset.s);
+    e.className = 'st' + (i < idx || st.stage === 'done' ? ' done' : i === idx ? ' on' : '');
+  });
+  let detail = st.detail || '';
+  if (st.stage === 'generating' && st.clips_total)
+    detail = `Wan 生成中：${st.clips_done || 0}/${st.clips_total} 段 clip 完成（单段 5-9 分钟，多卡并行）`;
+  document.getElementById('detail').textContent = detail;
+  if (st.shots && !shotsShown) { shotsShown = true; renderShots(st); }
+  if (st.stage === 'done') { clearInterval(timer); renderResult(); document.getElementById('go').disabled = false; }
+  if (st.stage === 'error') { clearInterval(timer); document.getElementById('go').disabled = false; }
+}
+
+function renderShots(st) {
+  const b = document.getElementById('board');
+  const c = el('div', 'card'); c.style.marginTop = '16px';
+  c.appendChild(el('h3', '', `导演分镜 · ${st.title || ''}`));
+  const g = el('div', 'grid cols3');
+  st.shots.forEach(s => {
+    const d = el('div', 'shot');
+    d.appendChild(el('div', 'meta', `Shot ${s.shot_id} · ${s.camera} · motion:${s.motion_level} · 转场:${s.transition_to_next || '—'}`));
+    d.appendChild(el('div', 'p', s.wan_prompt));
+    const kv = el('div', 'kv');
+    (s.expected_subjects || []).forEach(x => kv.appendChild(el('span', '', '🎯 ' + x)));
+    d.appendChild(kv);
+    g.appendChild(d);
+  });
+  c.appendChild(g); b.appendChild(c);
+}
+
+async function renderResult() {
+  const d = await (await fetch(`${API}/api/result/${jobId}`)).json();
+  const box = document.getElementById('result');
+  box.textContent = '';
+  for (const mk of Object.keys(d.evals)) {
+    const e = d.evals[mk];
+    const c = el('div', 'card'); c.style.marginTop = '16px';
+    const h = el('h3', '', `${mk} 成片 · 总分 `); h.style.marginTop = '0';
+    h.appendChild(scoreBadge(e.scores.total)); c.appendChild(h);
+    const g2 = el('div', 'grid cols2');
+    const left = el('div');
+    const video = el('video', 'player'); video.controls = true;
+    video.src = `/outputs/${jobId}/${mk}/film.mp4`;
+    left.appendChild(video);
+    const shots = el('div', 'kv'); shots.style.marginTop = '8px';
+    (d.meta.shots || []).forEach(s => {
+      const a = el('a', '', `clip${s.shot_id}`);
+      a.href = `/outputs/${jobId}/${mk}/shot${s.shot_id}.mp4`; a.target = '_blank';
+      const sp = el('span'); sp.appendChild(a); shots.appendChild(sp);
+    });
+    left.appendChild(shots);
+    g2.appendChild(left);
+    const right = el('div');
+    const tl = el('div'); right.appendChild(tl);
+    drawTimeline(tl, e, video);
+    g2.appendChild(right);
+    c.appendChild(g2);
+    c.appendChild(el('h3', '', `检出缺陷（${e.findings.length}）`));
+    c.appendChild(findingsTable(e.findings, t => { video.currentTime = t; video.play().catch(() => {}); }));
+    const t10 = el('div', 'note'); t10.style.marginTop = '8px';
+    t10.textContent = 'T10 语义对齐: ' + (e.t10_alignment || []).map(x => `shot${x.shot_id}=${x.score}/5`).join(' · ');
+    c.appendChild(t10);
+    const tm = el('div'); tm.style.marginTop = '12px';
+    tm.appendChild(el('h3', '', `评估 Agent 运行时长 ${fmtS(e.timing.total_s)}（${e.timing.vlm_calls} 次 VLM 调用）`));
+    timingBar(e.timing, tm); c.appendChild(tm);
+    box.appendChild(c);
+  }
+}
+</script>
+</body>
+</html>

@@ -98,7 +98,14 @@ class GpuWorker:
         g[..., 1] = g[..., 1] / (FH - 1) * 2 - 1
         warped = torch.nn.functional.grid_sample(small_gpu[1:], g, mode='bilinear',
                                                  padding_mode='border', align_corners=True)
-        return (warped - small_gpu[:-1]).abs().mean(dim=(1, 2, 3)) * 255.0
+        res = (warped - small_gpu[:-1]).abs().mean(dim=1)          # B-1,FH,FW 残差图
+        mean_r = res.mean(dim=(1, 2)) * 255.0
+        # T11 信号 A：残差图 8×8 分块均值。全帧均值会把「占画面 5% 的局部突变」
+        # 空间稀释掉；下游对每块做时间维 robust z（镜头运动导致边缘块残差恒高，
+        # 跨块比较无效，必须逐块和自己的历史比）——见 T11 提案 §2/§4
+        blocks = torch.nn.functional.adaptive_avg_pool2d(res.unsqueeze(1), (8, 8))
+        bflat = blocks.squeeze(1).flatten(1) * 255.0               # B-1,64
+        return mean_r, bflat
 
 
 _WORKERS = {}          # device -> GpuWorker（批量评估时跨视频复用，省 ~8s/条）
@@ -119,7 +126,7 @@ def scan(path, device='cuda:0'):
     th.start()
 
     lum, d1_parts, hsv_diff = [], [], []
-    feats, warps = [], []
+    feats, warps, wblocks = [], [], []
     prev_rgb_gpu = None           # 上一 chunk 末帧(GPU, 1,3,H,W)
     carry_small = None            # 跨 chunk 的最后一帧(RAFT 连续性)
     n = 0
@@ -160,7 +167,9 @@ def scan(path, device='cuda:0'):
             if carry_small is not None:
                 small = torch.cat([carry_small, small])
             if small.shape[0] >= 2:
-                warps.append(worker.raft_warp_residual(small))
+                mr, bf = worker.raft_warp_residual(small)
+                warps.append(mr)
+                wblocks.append(bf)
             carry_small = small[-1:]
         n = idx + len(frames)
     torch.cuda.synchronize()
@@ -170,6 +179,7 @@ def scan(path, device='cuda:0'):
     clip_d = torch.zeros(feats.shape[0])
     clip_d[1:] = 1 - (feats[1:] * feats[:-1]).sum(-1).cpu()
     warp = torch.cat([torch.zeros(1, device=device)] + warps).cpu().numpy()
+    wb = torch.cat([torch.zeros(1, 64, device=device)] + wblocks).cpu().numpy()  # T,64
     la = np.asarray(lum)
     flick = np.zeros(n)
     flick[1:-1] = np.abs(la[1:-1] - (la[:-2] + la[2:]) / 2)
@@ -185,7 +195,9 @@ def scan(path, device='cuda:0'):
                        'diff_d1': np.round(np.asarray(d1_parts), 2).tolist(),
                        'flicker': np.round(flick, 2).tolist(),
                        'clip_dist': np.round(clip_d.numpy(), 4).tolist(),
-                       'warp_residual': np.round(warp, 2).tolist()},
+                       'warp_residual': np.round(warp, 2).tolist(),
+                       'warp_block_max': np.round(wb.max(axis=1), 2).tolist()},
+           'warp_blocks': np.round(wb, 1).tolist(),
            'cuts_frames': cuts}
     return out
 

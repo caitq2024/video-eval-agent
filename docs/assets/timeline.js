@@ -5,7 +5,8 @@ const LANES = [
   ['diff_d1', '帧差 diff_d1'],
   ['flicker', '闪烁 flicker'],
   ['clip_dist', 'CLIP 距离'],
-  ['warp_residual', '光流 warp 残差'],
+  ['warp_residual', '光流 warp 残差(全帧均值)'],
+  ['warp_block_max', '局部块残差 max(T11)'],
 ];
 const LANE_H = 58, GAP = 14, PAD_L = 10, PAD_R = 10, AXIS_H = 22;
 
@@ -16,6 +17,7 @@ function drawTimeline(container, ev, video) {
   const nPts = series.luminance.length;
   const tOf = i => i * prev.stride / prev.fps;
 
+  const lanes = LANES.filter(([k]) => (series[k] || []).length);
   const canvas = document.createElement('canvas');
   const tip = document.createElement('div');
   tip.className = 'tl-tip';
@@ -23,7 +25,7 @@ function drawTimeline(container, ev, video) {
   container.appendChild(canvas);
   container.appendChild(tip);
 
-  const H = AXIS_H + LANES.length * (LANE_H + GAP);
+  const H = AXIS_H + lanes.length * (LANE_H + GAP);
   let W = 0;
 
   function xOf(t, w) { return PAD_L + t / dur * (w - PAD_L - PAD_R); }
@@ -49,7 +51,7 @@ function drawTimeline(container, ev, video) {
       ctx.fillRect(x - 0.5, AXIS_H - 9, 1, 3);
       ctx.fillText(t + 's', x - 6, AXIS_H - 12);
     }
-    LANES.forEach(([key, label], li) => {
+    lanes.forEach(([key, label], li) => {
       const y0 = AXIS_H + li * (LANE_H + GAP);
       const data = series[key] || [];
       const mx = Math.max(...data, 1e-6), mn = Math.min(...data, 0);
@@ -113,7 +115,7 @@ function drawTimeline(container, ev, video) {
       const tt = document.createElement('div');
       tt.appendChild(Object.assign(document.createElement('b'), { textContent: tOf(idx).toFixed(2) + 's' }));
       tip.appendChild(tt);
-      LANES.forEach(([key, label]) => {
+      lanes.forEach(([key, label]) => {
         const row = document.createElement('div');
         const k = document.createElement('span'); k.className = 'k';
         k.textContent = label.split(' ')[0] + ' ';

@@ -13,7 +13,7 @@ FFMPEG = os.path.join(EVAL_ROOT, 'bin', 'ffmpeg')
 OUT_ROOT = os.path.join(EVAL_ROOT, 'wan_outputs')
 PY = '/opt/pytorch/bin/python3'
 
-CLAUDE = 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'
+CLAUDE = 'global.anthropic.claude-opus-4-8'   # 裁决/导演主模型（客户指定 Opus 4-8）
 
 MODELS = {
     'wan2.1': {
@@ -55,7 +55,7 @@ def ask_claude(blocks, max_tokens=1500, model=CLAUDE, retries=4):
             r = bedrock().converse(
                 modelId=model,
                 messages=[{'role': 'user', 'content': blocks}],
-                inferenceConfig={'maxTokens': max_tokens, 'temperature': 0.0})
+                inferenceConfig={'maxTokens': max_tokens})  # opus-4-8 已弃用 temperature
             break
         except Exception as e:
             if attempt >= retries or 'Throttl' not in type(e).__name__ + str(e):

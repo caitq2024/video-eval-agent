@@ -350,10 +350,186 @@ def subject_probes(film, meta, model, spans, fps, device):
                             break
                     else:
                         run = 0
+            # T11 信号 C：主体轨迹动力学 —— 相邻子采样帧 bbox IoU 骤降 + 中心瞬移
+            # （区别于 T8 的对参考慢漂移；直接回答"哪个主体在哪一帧突变"）
+            # 只对单实例主体启用：复数主体（"fencing masks"）检测框会在实例间跳，
+            # IoU=0 是跟踪歧义而非瞬移
+            if not subj.lower().startswith(('a ', 'an ')):
+                continue
+            jumps = []
+            prev_i = None
+            for i in idxs:
+                if prev_i is not None and i - prev_i <= 2:
+                    b0, b1 = boxes[prev_i][1], boxes[i][1]
+                    ix0, iy0 = max(b0[0], b1[0]), max(b0[1], b1[1])
+                    ix1, iy1 = min(b0[2], b1[2]), min(b0[3], b1[3])
+                    inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+                    a0 = (b0[2] - b0[0]) * (b0[3] - b0[1])
+                    a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+                    iou = inter / (a0 + a1 - inter + 1e-6)
+                    diag = max(np.hypot(b1[2] - b1[0], b1[3] - b1[1]), 1.0)
+                    dist = np.hypot((b1[0] + b1[2] - b0[0] - b0[2]) / 2,
+                                    (b1[1] + b1[3] - b0[1] - b0[3]) / 2)
+                    jumps.append((prev_i, i, iou, dist / diag))
+                prev_i = i
+            if len(jumps) >= 6:
+                ratios = np.array([r for *_, r in jumps])
+                medr = float(np.median(ratios)) + 1e-6
+                mot_mult = {'low': 1.0, 'medium': 1.5, 'high': 2.2}[motion]
+                for pi, i, iou, r in jumps:
+                    if iou < 0.1 and r > max(0.8 * mot_mult, 4 * medr):
+                        u = [min(boxes[pi][1][0], boxes[i][1][0]),
+                             min(boxes[pi][1][1], boxes[i][1][1]),
+                             max(boxes[pi][1][2], boxes[i][1][2]),
+                             max(boxes[pi][1][3], boxes[i][1][3])]
+                        cand.append(dict(
+                            type='T11_local_candidate', subject=subj, shot=k + 1,
+                            start_s=round(pi / sub_fps, 2), end_s=round(i / sub_fps, 2),
+                            film_frames=[pi * SUB_EVERY, i * SUB_EVERY],
+                            region_640x360=[round(v, 1) for v in u],
+                            signal=f'相邻帧 bbox IoU={iou:.2f}<0.1 且中心瞬移 '
+                                   f'{r:.2f} 倍对角线（本镜中位 {medr:.2f}，'
+                                   f'motion={motion}）'))
+                        break        # 每主体每分镜最多报一处，交 VLM 精查
     # 逐子采样帧的主体在场轨迹（供 VLM 裁决交叉验证：像素证据优先于 VLM 印象）
     presence = {s: [b is not None for b in dets[s]] for s in subjects}
     return findings, {'candidates': cand, 'track_rates': track_rates,
                       'presence': presence, 'sub_fps': sub_fps}
+
+
+def detect_t11_blocks(sc, fps, ex, cuts, spans, shots, top_k=3):
+    """T11 信号 A：warp 残差 8×8 块矩阵 → **逐块时间维** robust z。
+    镜头运动会让边缘块残差恒高（clean 实测中位 38），跨块比较无效——每块只和
+    自己的历史比；再要求全局 z 低（全局也高的走 T1）+ 孤立尖峰 + 豁免/运动先验。"""
+    from e2_fuse import zscore
+    wb = np.asarray(sc.get('warp_blocks', []), np.float32)      # T,64
+    gm = np.asarray(sc['signals']['warp_residual'], np.float32)
+    if wb.ndim != 2 or len(wb) < 10:
+        return []
+    med = np.median(wb, axis=0)
+    mad = np.median(np.abs(wb - med), axis=0) + 0.5             # 0.5: 静块 MAD 下限
+    z = (wb - med) / (1.4826 * mad)                             # T,64
+    zb = z.max(axis=1)
+    bidx = z.argmax(axis=1)
+    zg = zscore(gm)
+    n_film = len(sc['signals']['luminance'])
+    active = wb > (med + 8.0)                                   # T,64 显著抬升掩码
+
+    def has_trail(k, b):
+        """运动物体跨块留轨迹：t±1 有「t 时不活跃」的新鲜邻块活跃 → 小目标在移动
+        （RAFT 对小目标光流常失败，块尖峰与 glitch 相同，靠轨迹区分）。
+        glitch 的足迹块在 t 和 t±1 是同一批，没有新鲜邻块。"""
+        row, col = b // 8, b % 8
+        nb = [r * 8 + c for r in (row - 1, row, row + 1)
+              for c in (col - 1, col, col + 1)
+              if 0 <= r < 8 and 0 <= c < 8 and r * 8 + c != b]
+        for kk in (k - 1, k + 1):
+            if 0 <= kk < len(wb):
+                fresh = active[kk, nb] & ~active[k, nb]
+                if fresh.any():
+                    return True
+        return False
+
+    def run_len(k, b):
+        """该块围绕 k 的连续高位长度（单帧 glitch 落在采样点会点亮相邻两个 warp 对）。"""
+        hi = z[:, b] > 0.5 * zb[k]
+        lo = k
+        while lo > 0 and hi[lo - 1]:
+            lo -= 1
+        hh = k
+        while hh + 1 < len(hi) and hi[hh + 1]:
+            hh += 1
+        return hh - lo + 1
+
+    out = []
+    taken = []                               # 已取候选的时间索引（去重）
+    for idx in np.argsort(-z, axis=None):
+        k, b = divmod(int(idx), 64)          # 逐 (时间,块) 格点选：同帧可能同时有
+        if z[k, b] < 6.0 or len(out) >= top_k:   # 运动小目标(被否)和真 glitch
+            break
+        if k < 2:                            # warp[0] 是填充零行，邻域不完整
+            continue
+        if any(abs(k - t) <= 2 for t in taken):
+            continue
+        if zg[k] > 2.5:                      # 全局也异常 → T1 通道处理
+            continue
+        if wb[k, b] < med[b] + 8.0:          # 绝对下限：残差抬升要有物理量
+            continue
+        if run_len(k, b) > 2:                # 该块持续高（≥3 采样）= 局部运动而非突变
+            continue
+        if has_trail(k, b):                  # 新鲜邻块轨迹 = 小目标运动，非 glitch
+            continue
+        i = k * 3                            # fast_scan SUB_EVERY=3 → 帧号
+        if i >= n_film or ex[min(i, n_film - 1)]:
+            continue
+        if any(abs(i - c) <= 4 for c in cuts):
+            continue
+        shot_k = shot_of(i / fps, spans)
+        mot = shots[min(shot_k, len(shots) - 1)].get('motion_level', 'medium')
+        if mot == 'high' and z[k, b] < 9.0:  # 高运动分镜提高门槛
+            continue
+        taken.append(k)
+        xy = [round((b % 8 + 0.5) / 8, 3), round((b // 8 + 0.5) / 8, 3)]
+        out.append(dict(
+            type='T11_local_candidate', subject=None, shot=shot_k + 1,
+            start_s=round(max(0, i - 3) / fps, 2), end_s=round(i / fps, 2),
+            film_frames=[max(0, i - 3), i],
+            region_xy_norm=xy,
+            signal=f'warp 残差块时间维 z={z[k, b]:.1f}（该块中位 {med[b]:.0f}→'
+                   f'{wb[k, b]:.0f}，全局 z={zg[k]:.1f} 低），孤立尖峰，'
+                   f'块位置 ({xy[0]:.2f},{xy[1]:.2f})'))
+    return out
+
+
+def vlm_t11_verdict(frames, ffps, c, meta, rubric):
+    """T11 专用裁决：整帧拼图 MLLM 裸看接近随机（Artifact-Bench）——
+    改为同一区域连续 4 帧的放大裁剪并排，把证据推到脸上。"""
+    import cv2
+    import vlm_common as V
+    H, W = frames[0].shape[:2]
+    f0, f1 = c['film_frames']
+    f1 = min(f1, len(frames) - 1)
+    if 'region_640x360' in c:
+        x0, y0, x1, y1 = c['region_640x360']
+        sx, sy = W / 640.0, H / 360.0
+        box = [x0 * sx, y0 * sy, x1 * sx, y1 * sy]
+    else:
+        cx, cy = c.get('region_xy_norm', [0.5, 0.5])
+        box = [(cx - 0.22) * W, (cy - 0.22) * H, (cx + 0.22) * W, (cy + 0.22) * H]
+    # padding ×1.4 并裁边
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    box = [max(0, int(box[0] - 0.2 * bw)), max(0, int(box[1] - 0.2 * bh)),
+           min(W, int(box[2] + 0.2 * bw)), min(H, int(box[3] + 0.2 * bh))]
+    if box[2] - box[0] < 24 or box[3] - box[1] < 24:
+        box = [0, 0, W, H]
+    ids = sorted(set([f0, min(f0 + 1, f1), max(f1 - 1, f0), f1]))
+    tiles = []
+    for fi in ids:
+        crop = frames[fi][box[1]:box[3], box[0]:box[2]]
+        th = 300
+        tile = cv2.resize(crop, (max(60, int(th * crop.shape[1] / crop.shape[0])), th))
+        cv2.rectangle(tile, (0, 0), (92, 22), (0, 0, 0), -1)
+        cv2.putText(tile, f'{fi / ffps:.3f}s', (4, 16), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 255, 255), 1)
+        tiles.append(tile)
+    hmax = max(t.shape[0] for t in tiles)
+    strip = np.hstack([np.pad(t, ((0, hmax - t.shape[0]), (0, 6), (0, 0)),
+                              constant_values=24) for t in tiles])
+    subj = f'subject "{c["subject"]}"' if c.get('subject') else 'the local region'
+    rub = '\n'.join(f'- {x}' for x in rubric)
+    p = (f'You are inspecting an AI-generated video for LOCAL temporal incoherence '
+         f'(object-level glitch between adjacent frames). Intended idea: '
+         f'"{meta["idea"]}"\nPre-registered criteria:\n{rub}\n\n'
+         f'A localized detector flagged {subj} at t={c["start_s"]}-{c["end_s"]}s: '
+         f'{c["signal"]}. Below are ENLARGED CROPS of the same region from 4 '
+         f'consecutive/near frames (timestamps burned in).\n'
+         f'Judge SPECIFICALLY: between adjacent crops, does the object teleport, '
+         f'morph, swap limbs/parts, or change shape in a physically impossible way? '
+         f'Normal motion blur / fast-but-continuous motion is acceptable.\n'
+         f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", '
+         f'"severity": 1-5, "reason": "<简体中文简述>", "confidence": 0.0-1.0}}')
+    parsed, raw = ask_claude([{'text': p}, V.img_block(strip)])
+    return parsed or {'verdict': 'PARSE_FAIL', 'reason': raw[:120]}
 
 
 # ---------------------------------------------------------------- S4/S5 VLM
@@ -364,6 +540,8 @@ def make_rubric(meta):
          f'{shots_txt}\n\nWrite 4-6 hard pass/fail criteria focused on: subject identity '
          'consistency within each shot, subject visibility, temporal continuity inside '
          'a shot (no unexpected cuts/jumps), and prompt adherence. '
+         'One criterion MUST cover local frame-to-frame continuity: 同一对象相邻帧之间'
+         '位置/形态/姿态必须连续，突变且无运动模糊解释则 FAIL。'
          '每条标准用简体中文书写。'
          'Respond ONLY with JSON: {"criteria": ["<中文标准>", ...]}')
     parsed, _ = ask_claude([{'text': p}])
@@ -425,6 +603,7 @@ def vlm_t10_alignment(frames, fps, span, shot, rubric):
 def score_findings(findings, t10):
     per_dim = {'temporal': 100.0, 'structural': 100.0, 'subject': 100.0, 'semantic': 100.0}
     dim_of = {'T1_jump': 'temporal', 'T2_flicker': 'temporal', 'T3_freeze': 'temporal',
+              'T11_local_incoherence': 'temporal',
               'T4_unexpected_cut': 'structural', 'T6_black': 'structural',
               'T5_out_of_frame': 'subject', 'T7_deform': 'subject',
               'T8_identity_drift': 'subject', 'T9_vanish': 'subject',
@@ -562,33 +741,39 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                     for s, arr in presence.items() if arr[lo:hi]}
 
         def judge_window(w):
-            wp = window_presence(w)
-            ctx = f'fused anomaly score {w["score"]} (soft signals).'
-            if wp:
-                ctx += (' Object-tracker detection rate in this window: '
-                        + ', '.join(f'"{s}" {r * 100:.0f}%' for s, r in wp.items())
-                        + '. A subject at ~100% IS present in every frame — do NOT '
-                          'claim it disappeared or went missing.')
+            """融合候选窗裁决。主体消失类结论采用双重验证（GroundingDINO 主判）：
+            - VLM 声称主体消失 + 跟踪器同窗口确有缺失 → 双重确认，置信扣分
+            - VLM 声称消失但单实例主体跟踪检出率满格 → 以跟踪器为准，否决 VLM
+            - 多实例主体（"two fencers"）跟踪器只能证明"至少一个在场"，保留 VLM 单票但降置信"""
+            ctx = f'fused anomaly score {w["score"]} (soft signals)'
             v = vlm_window_verdict(frames, ffps, w, meta, rubric, ctx)
-            if v.get('verdict') == 'defect':
-                # 交叉否决：VLM 声称主体消失，但单实例主体跟踪检出率满格 → 幻觉，拒绝
-                claim = (str(v.get('type', '')) + str(v.get('reason', ''))).lower()
-                vanish_kw = ['消失', '不见', 'disappear', 'vanish', 'missing',
-                             'absent', 'discontinu']
+            if v.get('verdict') != 'defect':
+                return None
+            claim = (str(v.get('type', '')) + str(v.get('reason', ''))).lower()
+            vanish_kw = ['消失', '不见', 'disappear', 'vanish', 'missing',
+                         'absent', 'discontinu']
+            conf = float(v.get('confidence', 0.6))
+            by = 'vlm'
+            if any(k in claim for k in vanish_kw):
+                wp = window_presence(w)
                 singular = {s: r for s, r in wp.items()
                             if s.lower().startswith(('a ', 'an '))}
-                if any(k in claim for k in vanish_kw) and singular and \
-                        min(singular.values()) >= 0.95:
+                if singular and min(singular.values()) >= 0.95:
                     vlm_rejected.append(dict(
                         window=[w['start_s'], w['end_s']],
                         vlm_claim=str(v.get('reason', ''))[:150],
-                        rejected_because='跟踪器证据否决：窗口内单实例主体检出率 '
+                        rejected_because='跟踪器主判否决：窗口内单实例主体检出率 '
                         + ', '.join(f'{s}={r * 100:.0f}%' for s, r in singular.items())))
                     return None
-                return dict(type='vlm_defect', start_s=w['start_s'], end_s=w['end_s'],
-                            severity=int(v.get('severity', 3)),
-                            evidence=f'{v.get("type")}: {v.get("reason", "")}'[:200],
-                            confidence=float(v.get('confidence', 0.6)), verdict_by='vlm')
+                if wp and min(wp.values()) < 0.6:
+                    by = 'dual'                 # VLM + 跟踪器双重确认
+                    conf = max(conf, 0.9)
+                else:
+                    conf = min(conf, 0.6)       # 跟踪器无法佐证，VLM 单票降置信
+            return dict(type='vlm_defect', start_s=w['start_s'], end_s=w['end_s'],
+                        severity=int(v.get('severity', 3)),
+                        evidence=f'{v.get("type")}: {v.get("reason", "")}'[:200],
+                        confidence=conf, verdict_by=by)
 
         def judge_candidate(c):
             ftype, tpl = CAND_MAP[c['type']]
@@ -596,12 +781,25 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
             ctx = tpl.format(**{k: c.get(k, '') for k in ('subject', 'shot', 'signal')})
             v = vlm_window_verdict(frames, ffps, win, meta, rubric, ctx)
             if v.get('verdict') == 'defect':
+                # T5 由跟踪器缺失发起 + VLM 确认意图 → 天然双重验证；T7/T8 单票 VLM
+                by = 'dual' if ftype == 'T5_out_of_frame' else 'vlm'
                 return dict(type=ftype, start_s=c['start_s'], end_s=c['end_s'],
                             severity=int(v.get('severity', 3)),
                             evidence=f'{c["subject"]}（分镜{c["shot"]}，'
                                      f'{c.get("signal", "检测缺失")}）：'
                                      f'{v.get("reason", "")}'[:220],
-                            confidence=float(v.get('confidence', 0.6)), verdict_by='vlm')
+                            confidence=float(v.get('confidence', 0.6)), verdict_by=by)
+
+        def judge_t11(c):
+            v = vlm_t11_verdict(frames, ffps, c, meta, rubric)
+            if v.get('verdict') == 'defect':
+                who = c.get('subject') or '局部区域'
+                return dict(type='T11_local_incoherence', start_s=c['start_s'],
+                            end_s=c['end_s'], severity=int(v.get('severity', 3)),
+                            evidence=f'{who}（分镜{c["shot"]}，{c["signal"]}）：'
+                                     f'{v.get("reason", "")}'[:220],
+                            confidence=float(v.get('confidence', 0.7)),
+                            verdict_by='dual')     # 局部信号 + VLM 双重确认
 
         def judge_t10(k_s):
             k, s = k_s
@@ -611,11 +809,28 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
 
         T10_VOTES = 3        # Bedrock 图像输入非严格确定，边界 2/3 分会翻转 → 三票取中位
 
+        # T11 候选：信号 A（块残差，全局低局部高）+ 信号 C（主体轨迹，已在探针中发起）
+        all_cands = sub_info.get('candidates', [])
+        t11_cands = [c for c in all_cands if c['type'] == 'T11_local_candidate']
+        other_cands = [c for c in all_cands if c['type'] != 'T11_local_candidate']
+        ex_mask = exempt_mask(n, fps, trans, TH['trans_margin_s'])
+        t11_cands += detect_t11_blocks(sc, fps, ex_mask, sc['cuts_frames'],
+                                       spans, meta['shots'])
+
+        def in_exempt(c):
+            """转场豁免也适用于轨迹信号：dissolve 叠化会出现双主体、cut 处构图跳变，
+            都是预期转场效果而非 T11。"""
+            lo = int(c['start_s'] * fps)
+            hi = min(n - 1, int(c['end_s'] * fps))
+            return bool(ex_mask[lo:hi + 1].any())
+
+        t11_cands = [c for c in t11_cands if not in_exempt(c)]
+
         # 除 rubric 外全部 VLM 调用并行（Bedrock 侧无依赖）
         with ThreadPoolExecutor(max_workers=16) as pool:
             fut_wins = [pool.submit(judge_window, w) for w in wins]
-            fut_cands = [pool.submit(judge_candidate, c)
-                         for c in sub_info.get('candidates', [])]
+            fut_cands = [pool.submit(judge_candidate, c) for c in other_cands] \
+                + [pool.submit(judge_t11, c) for c in t11_cands]
             fut_t10 = [(k, [pool.submit(judge_t10, (k, s)) for _ in range(T10_VOTES)])
                        for k, s in enumerate(meta['shots']) if k < len(spans)]
             for f in fut_wins + fut_cands:

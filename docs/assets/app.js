@@ -3,7 +3,8 @@ const TYPE_ZH = {
   T0_file_gate: 'T0 文件损坏', T1_jump: 'T1 跳帧', T2_flicker: 'T2 闪烁',
   T3_freeze: 'T3 冻结', T4_unexpected_cut: 'T4 意外切换', T5_out_of_frame: 'T5 主体出界',
   T6_black: 'T6 黑帧', T7_deform: 'T7 主体变形', T8_identity_drift: 'T8 身份漂移',
-  T9_vanish: 'T9 凭空消失', T10_misalignment: 'T10 语义不符', vlm_defect: 'VLM 判定缺陷',
+  T9_vanish: 'T9 凭空消失', T10_misalignment: 'T10 语义不符',
+  T11_local_incoherence: 'T11 局部时序不连贯', vlm_defect: 'VLM 判定缺陷',
 };
 const STAGE_ZH = {
   t0_gate_s: 'T0 文件gate', s1_scan_s: 'S1 全帧扫描', s2_detect_s: 'S2 直判',
@@ -54,7 +55,9 @@ function findingsTable(findings, onSeek) {
     const sv = el('td', 'num'); sv.appendChild(el('span', `sev sev${f.severity}`, 'S' + f.severity));
     tr.appendChild(sv);
     tr.appendChild(el('td', '', f.evidence || ''));
-    const vb = el('td'); vb.appendChild(el('span', `tag ${f.verdict_by}`, f.verdict_by === 'vlm' ? 'VLM' : '直判'));
+    const vb = el('td');
+    const vbLabel = { detector: '直判', vlm: 'VLM', dual: '双重验证' }[f.verdict_by] || f.verdict_by;
+    vb.appendChild(el('span', `tag ${f.verdict_by}`, vbLabel));
     tr.appendChild(vb);
     tr.onclick = () => onSeek && onSeek(f.start_s);
     t.appendChild(tr);
