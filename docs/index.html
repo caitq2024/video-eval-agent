@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>视频生成 Agent 质量评估平台</title>
+<style>
+  :root{--bg:#0d0d1a;--card:#16162a;--fg:#e8e8f0;--muted:#9898b0;--accent:#ff2ea6;--line:#2a2a44}
+  *{box-sizing:border-box;margin:0}
+  body{background:var(--bg);color:var(--fg);font-family:"PingFang SC","Microsoft YaHei",sans-serif;padding:32px;max-width:1200px;margin:0 auto}
+  h1{font-weight:300;font-size:32px;margin-bottom:6px}
+  .sub{color:var(--muted);margin-bottom:28px;font-size:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+  .card{background:var(--card);border:1px solid var(--line);padding:18px;border-radius:6px}
+  .card h3{font-size:16px;font-weight:500;margin-bottom:8px}
+  .card .meta{color:var(--muted);font-size:13px;line-height:1.6}
+  .badge{display:inline-block;background:var(--accent);color:#fff;font-size:12px;padding:2px 8px;border-radius:3px;margin-right:6px}
+  .placeholder{border:1px dashed var(--line);color:var(--muted);text-align:center;padding:60px 20px;border-radius:6px;margin-top:24px}
+  a{color:var(--accent)}
+  footer{margin-top:40px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<h1>视频生成 Agent 质量评估平台</h1>
+<div class="sub">导演分镜 → Wan2.1 / Wan2.2 生成 → 转场拼接 → 全帧探针 + Hybrid 裁决检测 · <a href="https://github.com/caitq2024/video-eval-agent">GitHub</a></div>
+<div id="app"><div class="placeholder">生成与评估数据准备中——wan_agent 管线产出 <code>docs/data/manifest.json</code> 后此处自动渲染 5 组 prompt × 2 模型的成片、缺陷时间轴与对比结论。</div></div>
+<script>
+fetch('data/manifest.json').then(r=>r.ok?r.json():null).then(m=>{
+  if(!m||!m.videos||!m.videos.length) return;
+  const app=document.getElementById('app');
+  app.innerHTML='<div class="grid">'+m.videos.map(v=>`
+    <div class="card">
+      <video src="assets/videos/${v.file}" controls preload="metadata" style="width:100%;border-radius:4px;background:#000"></video>
+      <h3 style="margin-top:10px">${v.title||v.file}</h3>
+      <div class="meta"><span class="badge">${v.model}</span>缺陷 ${v.findings_count??'?'} 处 · 总分 ${v.score??'—'}</div>
+    </div>`).join('')+'</div>';
+}).catch(()=>{});
+</script>
+<footer>hybrid video quality evaluation · taxonomy 见仓库 taxonomy/TAXONOMY.md</footer>
+</body>
+</html>
