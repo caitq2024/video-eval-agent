@@ -18,19 +18,21 @@
     <h2 style="margin-top:0">评估架构：探针定位 + Hybrid 裁决</h2>
     <p class="sub">VANE-Bench 实测表明"把视频直接丢给多模态大模型"无法可靠检测细微时空异常。
     我们的方案：<b>全帧探针扫描定位异常窗 → 像素证据充分的 detector 直判 → 证据不足的候选窗交
-    Claude+rubric 定向裁决</b>。合成缺陷视频上 10 类缺陷拦截 21/22（95%）、零误报；本平台展示的是
-    该管线对 <b>真实 Wan2.1/2.2 生成视频</b> 的检测结果。</p>
+    Claude+rubric 定向裁决</b>。v1 的 10 类在合成缺陷黄金集上拦截 21/22（95%）、零误报；
+    现已扩展为 <b>20 类分类体系（v2）</b>，覆盖人体解剖、物理、交互、文字、运镜、跨镜头一致性与
+    生成 Agent 管线层。本平台展示的是该管线对 <b>真实 Wan2.1/2.2 生成视频</b> 的检测结果。</p>
     <div class="pipeline-steps">
       <span class="step">T0 ffprobe gate</span><span class="arr">→</span>
       <span class="step">S1 全帧信号扫描（亮度/帧差/闪烁/CLIP/光流warp，GPU 秒级）</span><span class="arr">→</span>
       <span class="step">S2 直判（黑帧/冻结/闪烁/跳帧/意外切换，转场豁免）</span><span class="arr">→</span>
-      <span class="step">S3 GroundingDINO 主体探针（出界/变形/色相漂移）</span><span class="arr">→</span>
-      <span class="step">S4 信号融合 Top-K 候选窗 → Claude 定向裁决</span><span class="arr">→</span>
-      <span class="step">S5 T10 语义对齐（rubric 先行）</span>
+      <span class="step">S3 GroundingDINO 主体探针（出界/变形/色相漂移/轨迹瞬移）</span><span class="arr">→</span>
+      <span class="step">S3b v2 探针（人体关键点/交互区域/相机光流/文字提取）</span><span class="arr">→</span>
+      <span class="step">S4 信号融合 Top-K 候选窗 → Claude 定向裁决（全并行）</span><span class="arr">→</span>
+      <span class="step">S5 T10 语义对齐（rubric 先行，三票中位）</span>
     </div>
   </div>
 
-  <h2>10 类缺陷分类体系</h2>
+  <h2>20 类缺陷分类体系（v1 十类 + v2 扩展）</h2>
   <div class="card" style="overflow-x:auto">
     <table>
       <tr><th>#</th><th>错误类型</th><th>定义与典型表现</th><th>检测信号</th><th>拦截层</th><th>合成测试拦截</th></tr>
