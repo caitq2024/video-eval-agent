@@ -45,6 +45,16 @@
       <label><input type="checkbox" id="m21"> Wan2.1-1.3B</label>
       <button id="go">生成并审核</button>
     </div>
+    <div style="margin:14px 0 8px;border-top:1px solid var(--border);padding-top:12px">
+      <b>或：上传你自己的视频做质量审核</b>（mp4/mov/webm，≤50MB；描述可选但建议填 ——
+      有描述才能做语义对齐与主体跟踪）
+    </div>
+    <div class="form">
+      <input type="file" id="vfile" accept="video/mp4,video/quicktime,video/webm"
+             style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--ink-2)">
+      <textarea id="vprompt" placeholder="（可选）这段视频应该是什么内容？例如：一只柯基在雪地里追飞盘"></textarea>
+      <button id="goUpload">上传并审核</button>
+    </div>
     <div class="stagebar" id="stages" style="display:none">
       <span class="st" data-s="queued">排队</span>
       <span class="st" data-s="directing">导演拆分镜</span>
@@ -93,6 +103,25 @@ document.getElementById('go').onclick = async () => {
   timer = setInterval(poll, 3000);
 };
 
+document.getElementById('goUpload').onclick = async () => {
+  const f = document.getElementById('vfile').files[0];
+  if (!f) { alert('请选择视频文件'); return; }
+  if (f.size > 50 * 1024 * 1024) { alert('文件超过 50MB 限制'); return; }
+  const fd = new FormData();
+  fd.append('video', f);
+  fd.append('prompt', document.getElementById('vprompt').value.trim());
+  document.getElementById('goUpload').disabled = true;
+  const r = await fetch(API + '/api/upload', { method: 'POST', body: fd });
+  const d = await r.json();
+  document.getElementById('goUpload').disabled = false;
+  if (d.error) { alert(d.error); return; }
+  jobId = d.job_id; shotsShown = false;
+  document.getElementById('stages').style.display = 'flex';
+  document.getElementById('board').textContent = '';
+  document.getElementById('result').textContent = '';
+  timer = setInterval(poll, 3000);
+};
+
 async function poll() {
   const st = await (await fetch(`${API}/api/status/${jobId}`)).json();
   const idx = ORDER.indexOf(st.stage);
@@ -133,7 +162,7 @@ async function renderResult() {
   for (const mk of Object.keys(d.evals)) {
     const e = d.evals[mk];
     const c = el('div', 'card'); c.style.marginTop = '16px';
-    const h = el('h3', '', `${mk} 成片 · 总分 `); h.style.marginTop = '0';
+    const h = el('h3', '', `${mk === 'user' ? '上传视频' : mk + ' 成片'} · 总分 `); h.style.marginTop = '0';
     h.appendChild(scoreBadge(e.scores.total)); c.appendChild(h);
     const g2 = el('div', 'grid cols2');
     const left = el('div');

@@ -591,8 +591,8 @@ def detect_t20(meta, model, gate, clips_gate, trans, sig, fps, n):
                       evidence=f'成片时长 {gate["duration_s"]:.1f}s 与分镜规划 '
                                f'{expect_dur:.1f}s 偏差 >1s（规格不符）',
                       confidence=0.95, verdict_by='detector'))
-    want_fps = MODELS[model]['fps']
-    if gate.get('fps') and abs(gate['fps'] - want_fps) > 1:
+    want_fps = MODELS.get(model, {}).get('fps')     # 上传视频等非 Wan 产物无规格约束
+    if want_fps and gate.get('fps') and abs(gate['fps'] - want_fps) > 1:
         F.append(dict(type='T20_pipeline', start_s=0.0, end_s=0.0, severity=3,
                       evidence=f'成片帧率 {gate["fps"]} 与规格 {want_fps} 不符',
                       confidence=0.95, verdict_by='detector'))

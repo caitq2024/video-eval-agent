@@ -28,6 +28,7 @@ from run_pipeline import stitch_prompt
 
 DOCS = os.path.join(EVAL_ROOT, 'repo', 'docs')
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024      # 上传限 50MB
 JOBS = {}                     # job_id -> state dict（内存态；产物落盘 wan_outputs）
 WORK_Q = queue.Queue()        # 串行执行：生成占整卡，评估占一卡，避免任务间打架
 
@@ -97,11 +98,62 @@ def run_job(jid):
         set_state(jid, stage='error', detail=f'{type(e).__name__}: {e}'[:300])
 
 
+def run_upload_job(jid):
+    """上传视频的 adhoc 评估：无导演分镜 → 构造单镜头元数据（主体由 LLM 从描述提取）。"""
+    from common import ask_claude, ffprobe_meta
+    st = JOBS[jid]
+    pdir = os.path.join(OUT_ROOT, jid)
+    film = os.path.join(pdir, 'user', 'film.mp4')
+    try:
+        gate = ffprobe_meta(film)
+        if not gate['decodable']:
+            set_state(jid, stage='error', detail='视频无法解码')
+            return
+        dur = round(gate.get('duration_s') or 5.0, 2)
+        prompt = st.get('idea') or ''
+        subjects, motion = [], 'medium'
+        if prompt:
+            set_state(jid, stage='directing', detail='解析视频描述（提取主体/运动先验）…')
+            parsed, _ = ask_claude([{'text':
+                f'用户上传了一段 AI 生成视频并描述其内容："{prompt}"。\n'
+                f'为开放词汇检测器提取应持续可见的主体短语（英文，如 "a corgi dog"），'
+                f'并估计画面运动等级。Respond ONLY with JSON: '
+                f'{{"expected_subjects": ["..."], "motion_level": "low|medium|high", '
+                f'"camera": "static|slow_pan|tracking|handheld|orbit|zoom"}}'}])
+            parsed = parsed or {}
+            subjects = parsed.get('expected_subjects', [])[:3]
+            motion = parsed.get('motion_level', 'medium')
+            camera = parsed.get('camera', 'handheld')
+        else:
+            camera = 'handheld'
+        meta = {'id': jid, 'idea': prompt or '（用户未提供描述，跳过语义对齐）',
+                'title': '用户上传视频', 'title_zh': '用户上传视频',
+                'shots': [{'shot_id': 1, 'wan_prompt': prompt or 'user uploaded video',
+                           'expected_subjects': subjects, 'camera': camera,
+                           'motion_level': motion, 'duration_s': dur,
+                           'transition_to_next': None}],
+                'films': {'user': {'transitions': []}}, 'generation': {}}
+        json.dump(meta, open(os.path.join(pdir, 'shots.json'), 'w'),
+                  ensure_ascii=False, indent=1)
+        set_state(jid, shots=meta['shots'], stage='evaluating',
+                  detail='质量评估 Agent 检测中…')
+        from evaluate import evaluate
+        dev = f'cuda:{(free_gpus() or [0])[0]}'
+        e = evaluate(jid, 'user', dev, use_vlm=bool(prompt) or True)
+        set_state(jid, stage='done', detail='完成', scores={'user': e['scores']['total']})
+    except Exception as ex:
+        traceback.print_exc()
+        set_state(jid, stage='error', detail=f'{type(ex).__name__}: {ex}'[:300])
+
+
 def worker():
     while True:
         jid = WORK_Q.get()
         try:
-            run_job(jid)
+            if JOBS.get(jid, {}).get('kind') == 'upload':
+                run_upload_job(jid)
+            else:
+                run_job(jid)
         finally:
             WORK_Q.task_done()
 
@@ -117,6 +169,24 @@ def submit():
     jid = 'demo_' + uuid.uuid4().hex[:8]
     JOBS[jid] = {'job_id': jid, 'idea': idea, 'n_shots': n_shots, 'models': models,
                  'stage': 'queued', 'detail': f'排队中（前面还有 {WORK_Q.qsize()} 个任务）',
+                 'created': time.time()}
+    WORK_Q.put(jid)
+    return jsonify({'job_id': jid})
+
+
+@app.post('/api/upload')
+def upload():
+    f = request.files.get('video')
+    if not f or not f.filename.lower().endswith(('.mp4', '.mov', '.webm', '.mkv')):
+        return jsonify({'error': '请上传 mp4/mov/webm 视频文件（≤50MB）'}), 400
+    jid = 'upload_' + uuid.uuid4().hex[:8]
+    pdir = os.path.join(OUT_ROOT, jid, 'user')
+    os.makedirs(pdir, exist_ok=True)
+    f.save(os.path.join(pdir, 'film.mp4'))
+    JOBS[jid] = {'job_id': jid, 'kind': 'upload',
+                 'idea': (request.form.get('prompt') or '').strip()[:300],
+                 'models': ['user'], 'n_shots': 1,
+                 'stage': 'queued', 'detail': f'排队中（前面 {WORK_Q.qsize()} 个任务）',
                  'created': time.time()}
     WORK_Q.put(jid)
     return jsonify({'job_id': jid})
@@ -148,7 +218,7 @@ def result(jid):
         return jsonify({'error': 'not found'}), 404
     meta = json.load(open(sp))
     out = {'meta': meta, 'evals': {}}
-    for mk in MODELS:
+    for mk in list(MODELS) + ['user']:
         ep = os.path.join(pdir, mk, 'eval.json')
         if os.path.exists(ep):
             out['evals'][mk] = json.load(open(ep))
