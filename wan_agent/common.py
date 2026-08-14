@@ -58,9 +58,13 @@ def ask_claude(blocks, max_tokens=1500, model=CLAUDE, retries=4):
                 inferenceConfig={'maxTokens': max_tokens})  # opus-4-8 已弃用 temperature
             break
         except Exception as e:
-            if attempt >= retries or 'Throttl' not in type(e).__name__ + str(e):
+            desc = type(e).__name__ + str(e)
+            retriable = any(k in desc for k in
+                            ('Throttl', 'ServiceUnavailable', 'ModelError',
+                             'Timeout', 'Connection'))
+            if attempt >= retries or not retriable:
                 raise
-            time.sleep(1.5 ** attempt + random.random())
+            time.sleep(2.0 ** attempt + random.random())
     text = r['output']['message']['content'][0]['text']
     m = re.search(r'\{.*\}', text, re.S)
     if not m:

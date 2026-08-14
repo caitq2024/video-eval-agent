@@ -38,6 +38,8 @@ def main():
                 'wan2.1': {'label': 'Wan2.1-T2V-1.3B', 'size': '832x480', 'fps': 16},
                 'wan2.2': {'label': 'Wan2.2-TI2V-5B', 'size': '1280x704', 'fps': 24}}}
     for pid in sorted(os.listdir(OUT_ROOT)):
+        if pid.startswith('demo_'):
+            continue                     # 现场 demo 任务不进展示站
         sp = os.path.join(OUT_ROOT, pid, 'shots.json')
         if not os.path.exists(sp):
             continue

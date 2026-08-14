@@ -100,6 +100,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .tag.detector { background: rgba(57, 135, 229, .15); color: var(--s1); }
 .tag.vlm { background: rgba(217, 89, 38, .15); color: var(--s2); }
 .tag.dual { background: rgba(25, 158, 112, .15); color: var(--s3); }
+.tag.llm { background: rgba(144, 133, 233, .15); color: #9085e9; }
 
 .sev { font-weight: 700; }
 .sev5, .sev4 { color: var(--critical); }

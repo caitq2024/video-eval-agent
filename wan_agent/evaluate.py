@@ -260,6 +260,7 @@ def subject_probes(film, meta, model, spans, fps, device):
 
     findings, cand = [], []
     track_rates = {}
+    shot_hue = {}                # subj -> {shot: 中位色相直方图}（T19 跨镜头比对用）
     for subj in subjects:
         # 该主体应出现的分镜集合
         want = [k for k, s in enumerate(meta['shots'])
@@ -330,6 +331,9 @@ def subject_probes(film, meta, model, spans, fps, device):
                     else:
                         run = 0
             hv = [(i, hh) for i, hh in zip(idxs, hists) if hh is not None]
+            if len(hv) >= 4:
+                shot_hue.setdefault(subj, {})[k + 1] = np.median(
+                    np.stack([h for _, h in hv]), 0)
             if len(hv) >= 6:
                 ref_n = max(2, min(len(hv) // 3, int(sub_fps)))
                 href = np.median(np.stack([h for _, h in hv[:ref_n]]), 0)
@@ -394,7 +398,8 @@ def subject_probes(film, meta, model, spans, fps, device):
     # 逐子采样帧的主体在场轨迹（供 VLM 裁决交叉验证：像素证据优先于 VLM 印象）
     presence = {s: [b is not None for b in dets[s]] for s in subjects}
     return findings, {'candidates': cand, 'track_rates': track_rates,
-                      'presence': presence, 'sub_fps': sub_fps}
+                      'presence': presence, 'sub_fps': sub_fps,
+                      'shot_hue': shot_hue}
 
 
 def detect_t11_blocks(sc, fps, ex, cuts, spans, shots, top_k=3):
@@ -532,14 +537,163 @@ def vlm_t11_verdict(frames, ffps, c, meta, rubric):
     return parsed or {'verdict': 'PARSE_FAIL', 'reason': raw[:120]}
 
 
+# ------------------------------------------------- V2 第一批：T17/T19/T20
+def detect_t17(sig, fps, spans, shots, ex):
+    """T17 运动动态性：幅度失配直判 + 重复循环候选（→VLM）。
+    校准（10 成片实测）：motion=high 分镜帧差中位 12.1、正常最低 3.1；
+    唯一 <2 的 (1.4) 是导演要求跃起接盘但柯基只小跑的真缺陷。"""
+    n = len(sig['luminance'])
+    d1 = align_n(sig['diff_d1'], n)
+    F, cands = [], []
+    AMP_TH = {'high': 2.0, 'medium': 0.5}
+    for k, (a, b) in enumerate(spans):
+        s = shots[min(k, len(shots) - 1)]
+        lo, hi = int(a * fps), min(n, int(b * fps))
+        seg = d1[lo:hi]
+        seg = seg[~ex[lo:hi]] if ex[lo:hi].any() else seg    # 排除转场帧
+        if len(seg) < int(fps):
+            continue
+        med = float(np.median(seg))
+        lvl = s.get('motion_level', 'medium')
+        if lvl in AMP_TH and med < AMP_TH[lvl]:
+            F.append(dict(type='T17_motion_dynamics', start_s=round(a, 2),
+                          end_s=round(b, 2), severity=3,
+                          evidence=f'分镜{k + 1} 要求 motion={lvl} 但实际运动量极低'
+                                   f'（帧差中位 {med:.2f}，同级正常 ≥{AMP_TH[lvl]}；'
+                                   f'画面有像素变化但运动语义不达标，区别于 T3 硬冻结）',
+                          confidence=0.85, verdict_by='detector'))
+            continue
+        # 重复循环候选：镜头内帧差曲线自相关周期峰（AIGV 不自然时间自相似性,ATSS）
+        x = seg - seg.mean()
+        if len(x) >= int(3 * fps) and x.std() > 0.3:
+            ac = np.correlate(x, x, 'full')[len(x) - 1:]
+            ac /= (ac[0] + 1e-9)
+            lags = ac[int(0.5 * fps):int(min(2.5 * fps, len(ac) - 1))]
+            if len(lags) and lags.max() > 0.85:
+                cands.append(dict(shot=k + 1, start_s=round(a, 2), end_s=round(b, 2),
+                                  peak=round(float(lags.max()), 2)))
+    return F, cands[:1]          # 循环候选每片最多 1 个交 VLM
+
+
+def detect_t20(meta, model, gate, clips_gate, trans, sig, fps, n):
+    """T20 管线执行缺陷：规格对照 + 转场执行质量（近零成本，不看语义）。
+    DirectorBench：转场质量是全行业最弱环节（均分 0.256）。"""
+    from common import MODELS
+    F = []
+    shots = meta['shots']
+    # 1) 规格对照：成片时长 = Σ分镜 − Σ交叠
+    n_fade = sum(1 for t in trans if t['type'] in ('fade', 'dissolve'))
+    expect_dur = sum(s['duration_s'] for s in shots) - 0.5 * n_fade
+    if gate.get('duration_s') and abs(gate['duration_s'] - expect_dur) > 1.0:
+        F.append(dict(type='T20_pipeline', start_s=0.0, end_s=round(gate['duration_s'], 2),
+                      severity=3,
+                      evidence=f'成片时长 {gate["duration_s"]:.1f}s 与分镜规划 '
+                               f'{expect_dur:.1f}s 偏差 >1s（规格不符）',
+                      confidence=0.95, verdict_by='detector'))
+    want_fps = MODELS[model]['fps']
+    if gate.get('fps') and abs(gate['fps'] - want_fps) > 1:
+        F.append(dict(type='T20_pipeline', start_s=0.0, end_s=0.0, severity=3,
+                      evidence=f'成片帧率 {gate["fps"]} 与规格 {want_fps} 不符',
+                      confidence=0.95, verdict_by='detector'))
+    for name, g in clips_gate.items():
+        if not g.get('decodable'):
+            F.append(dict(type='T20_pipeline', start_s=0.0, end_s=0.0, severity=5,
+                          evidence=f'分镜 clip {name} 生成失败或无法解码',
+                          confidence=0.99, verdict_by='detector'))
+    # 2) 转场执行：dissolve/fade 窗内不应有硬切（有 = 未平滑执行/残影）
+    d1 = align_n(sig['diff_d1'], n)
+    for t in trans:
+        lo, hi = int(t['start_s'] * fps), min(n, int(t['end_s'] * fps) + 1)
+        if t['type'] in ('fade', 'dissolve') and hi > lo:
+            if float(d1[lo:hi].max()) > 25.0:
+                F.append(dict(type='T20_pipeline', start_s=t['start_s'],
+                              end_s=t['end_s'], severity=3,
+                              evidence=f'{t["type"]} 转场窗内出现帧差 '
+                                       f'{d1[lo:hi].max():.0f}>25 的硬跳变'
+                                       f'（转场未平滑执行/残影）',
+                              confidence=0.85, verdict_by='detector'))
+    return F
+
+
+def check_rewrite_fidelity(meta, pdir):
+    """T20 子项：导演改写忠实度 —— 创意关键要素是否在 wan_prompt 中丢失。
+    纯文本 LLM diff，跨模型共享缓存（文献空白项，MovieAgent 只有间接指标）。"""
+    cache = os.path.join(pdir, 'rewrite_check.json')
+    if os.path.exists(cache):
+        return json.load(open(cache))
+    shots_txt = '\n'.join(f'Shot {s["shot_id"]}: {s["wan_prompt"]}'
+                          for s in meta['shots'])
+    p = (f'用户创意（中文）："{meta["idea"]}"\n'
+         f'导演 Agent 改写出的分镜 prompts：\n{shots_txt}\n\n'
+         f'列出创意中的关键要素（主体/动作/场景/风格/文字内容），逐个判断是否被'
+         f'至少一个分镜 prompt 覆盖。只报告确实完全丢失的关键要素（宽松判定，'
+         f'语义等价即算覆盖）。用简体中文。\n'
+         f'Respond ONLY with JSON: {{"missing_critical": ["<丢失的关键要素>"], '
+         f'"note": "<一句话>"}}')
+    parsed, _ = ask_claude([{'text': p}])
+    out = parsed or {'missing_critical': []}
+    json.dump(out, open(cache, 'w'), ensure_ascii=False)
+    return out
+
+
+def vlm_t19_cross_shot(frames, ffps, spans, meta, rubric, hue_ctx=''):
+    """T19 跨镜头一致性：每镜头取中点帧并排 → 封闭式问题（角色/道具/风格跨镜头）。
+    主流评估的盲区（Movie Gen 的 consistency 仍是单镜头内定义）。"""
+    import cv2
+    import vlm_common as V
+    tiles = []
+    for k, (a, b) in enumerate(spans):
+        fi = min(len(frames) - 1, int((a + b) / 2 * ffps))
+        t = frames[fi]
+        th = 300
+        tile = cv2.resize(t, (int(th * t.shape[1] / t.shape[0]), th))
+        cv2.rectangle(tile, (0, 0), (110, 24), (0, 0, 0), -1)
+        cv2.putText(tile, f'Shot {k + 1}', (5, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 255, 255), 2)
+        tiles.append(tile)
+    strip = np.hstack([np.pad(t, ((0, 0), (0, 8), (0, 0)), constant_values=24)
+                       for t in tiles])
+    shots_txt = '\n'.join(f'Shot {s["shot_id"]}: {s["wan_prompt"][:150]}'
+                          for s in meta['shots'])
+    p = (f'You are checking CROSS-SHOT consistency of a storyboard-generated video. '
+         f'Storyboard:\n{shots_txt}\n{hue_ctx}\n'
+         f'Below: one representative frame per shot, side by side.\n'
+         f'Judge ONLY cross-shot issues: (1) is the main character/subject the SAME '
+         f'entity across shots (clothing, colors, props, breed/model)? '
+         f'(2) is the visual style/color-grade consistent? '
+         f'(3) any prop that must persist (per storyboard) changed or vanished '
+         f'between shots? Shot-to-shot camera/framing changes are expected.\n'
+         f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", "severity": 1-5, '
+         f'"aspect": "identity|style|prop|none", "reason": "<简体中文简述>", '
+         f'"confidence": 0.0-1.0}}')
+    parsed, raw = ask_claude([{'text': p}, V.img_block(strip)])
+    return parsed or {'verdict': 'PARSE_FAIL', 'reason': raw[:120]}
+
+
+def vlm_t17_loop(frames, ffps, c, meta, rubric):
+    import vlm_common as V
+    a, b = c['start_s'], c['end_s']
+    ids = [min(len(frames) - 1, int((a + (b - a) * i / 9) * ffps)) for i in range(9)]
+    sheet = V.contact_sheet([(frames[k], k / ffps) for k in ids], cols=3, tile_w=280)
+    p = (f'Shot {c["shot"]} of an AI video was flagged for possible content LOOPING '
+         f'(autocorrelation peak {c["peak"]}). Below are 9 evenly spaced frames.\n'
+         f'Is the content unnaturally repeating/cycling (same motion pattern looping), '
+         f'or is it legitimate periodic motion (walking, waves) / normal progression?\n'
+         f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", "severity": 1-5, '
+         f'"reason": "<简体中文简述>", "confidence": 0.0-1.0}}')
+    parsed, raw = ask_claude([{'text': p}, V.img_block(sheet)])
+    return parsed or {'verdict': 'PARSE_FAIL', 'reason': raw[:120]}
+
+
 # ---------------------------------------------------------------- S4/S5 VLM
 def make_rubric(meta):
     shots_txt = '\n'.join(f'Shot {s["shot_id"]}: {s["wan_prompt"]}' for s in meta['shots'])
     p = ('You are designing evaluation criteria for an AI-generated multi-shot video '
          'BEFORE seeing it (to avoid being biased by the output). The storyboard:\n'
          f'{shots_txt}\n\nWrite 4-6 hard pass/fail criteria focused on: subject identity '
-         'consistency within each shot, subject visibility, temporal continuity inside '
-         'a shot (no unexpected cuts/jumps), and prompt adherence. '
+         'consistency within each shot AND ACROSS shots (character clothing/props/'
+         'style must persist from shot to shot), subject visibility, temporal '
+         'continuity inside a shot (no unexpected cuts/jumps), and prompt adherence. '
          'One criterion MUST cover local frame-to-frame continuity: 同一对象相邻帧之间'
          '位置/形态/姿态必须连续，突变且无运动模糊解释则 FAIL。'
          '每条标准用简体中文书写。'
@@ -558,15 +712,15 @@ def read_film_frames(path):
     return V.read_frames(path)
 
 
-def vlm_window_verdict(frames, fps, win, meta, rubric, context):
+def vlm_window_verdict(frames, fps, win, meta, rubric, context, trans_txt=''):
     n = len(frames)
     c = int((win['start_s'] + win['end_s']) / 2 * fps)
     lo = max(0, min(n - 8, c - 4))
     step = max(1, int((win['end_s'] - win['start_s']) * fps / 8)) or 1
     ids = [min(n - 1, lo + i * step) for i in range(8)]
     rub = '\n'.join(f'- {x}' for x in rubric)
-    p = (f'You are inspecting an AI-generated video (storyboard-based, planned transitions '
-         f'are OK). Intended idea: "{meta["idea"]}"\n'
+    p = (f'You are inspecting an AI-generated video assembled from a storyboard. '
+         f'{trans_txt}Intended idea: "{meta["idea"]}"\n'
          f'Pre-registered criteria:\n{rub}\n\n'
          f'A detector flagged t={win["start_s"]}-{win["end_s"]}s: {context}. '
          f'Below are 8 frames from that region (timestamps burned in).\n'
@@ -603,7 +757,8 @@ def vlm_t10_alignment(frames, fps, span, shot, rubric):
 def score_findings(findings, t10):
     per_dim = {'temporal': 100.0, 'structural': 100.0, 'subject': 100.0, 'semantic': 100.0}
     dim_of = {'T1_jump': 'temporal', 'T2_flicker': 'temporal', 'T3_freeze': 'temporal',
-              'T11_local_incoherence': 'temporal',
+              'T11_local_incoherence': 'temporal', 'T17_motion_dynamics': 'temporal',
+              'T19_cross_shot': 'subject', 'T20_pipeline': 'structural',
               'T4_unexpected_cut': 'structural', 'T6_black': 'structural',
               'T5_out_of_frame': 'subject', 'T7_deform': 'subject',
               'T8_identity_drift': 'subject', 'T9_vanish': 'subject',
@@ -665,9 +820,13 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
     trans = meta.get('films', {}).get(model, {}).get('transitions', [])
     spans = shot_spans(meta, model, sc['duration_s'])
 
-    # S2 direct detectors
+    # S2 direct detectors（v1 全帧时序 + v2 第一批：T20 管线规格/转场执行、T17 幅度失配）
     t0 = time.time()
     findings = detect_hard(sc['signals'], sc['cuts_frames'], fps, meta, model, spans, trans)
+    findings += detect_t20(meta, model, gate, clips_gate, trans, sc['signals'], fps, n)
+    ex_all = exempt_mask(n, fps, trans, TH['trans_margin_s'])
+    t17_f, t17_loop_cands = detect_t17(sc['signals'], fps, spans, meta['shots'], ex_all)
+    findings += t17_f
     timing['s2_detect_s'] = round(time.time() - t0, 2)
 
     # S3 subject probes
@@ -730,6 +889,16 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
 
         presence = sub_info.get('presence', {})
         p_sub_fps = sub_info.get('sub_fps')
+        # 计划转场时间表：VLM 裁决必须知道镜头边界在哪，否则会把计划切点
+        # 误判为"镜头内时间连续性断裂"（p4 实测盲区）
+        trans_txt = ''
+        if trans:
+            items = ', '.join(f'{t["type"]} at {t["start_s"]}-{t["end_s"]}s'
+                              for t in trans)
+            trans_txt = (f'PLANNED shot transitions (composition/scene changes at these '
+                         f'times are EXPECTED, not defects): {items}. Shot boundaries: '
+                         + ', '.join(f'shot{i + 1}={a:.1f}-{b:.1f}s'
+                                     for i, (a, b) in enumerate(spans)) + '. ')
 
         def window_presence(w):
             """窗口内各主体的跟踪检出率（像素证据，用于约束/否决 VLM 印象）。"""
@@ -746,7 +915,7 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
             - VLM 声称消失但单实例主体跟踪检出率满格 → 以跟踪器为准，否决 VLM
             - 多实例主体（"two fencers"）跟踪器只能证明"至少一个在场"，保留 VLM 单票但降置信"""
             ctx = f'fused anomaly score {w["score"]} (soft signals)'
-            v = vlm_window_verdict(frames, ffps, w, meta, rubric, ctx)
+            v = vlm_window_verdict(frames, ffps, w, meta, rubric, ctx, trans_txt)
             if v.get('verdict') != 'defect':
                 return None
             claim = (str(v.get('type', '')) + str(v.get('reason', ''))).lower()
@@ -779,7 +948,7 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
             ftype, tpl = CAND_MAP[c['type']]
             win = {'start_s': c['start_s'], 'end_s': max(c['end_s'], c['start_s'] + 0.5)}
             ctx = tpl.format(**{k: c.get(k, '') for k in ('subject', 'shot', 'signal')})
-            v = vlm_window_verdict(frames, ffps, win, meta, rubric, ctx)
+            v = vlm_window_verdict(frames, ffps, win, meta, rubric, ctx, trans_txt)
             if v.get('verdict') == 'defect':
                 # T5 由跟踪器缺失发起 + VLM 确认意图 → 天然双重验证；T7/T8 单票 VLM
                 by = 'dual' if ftype == 'T5_out_of_frame' else 'vlm'
@@ -826,6 +995,44 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
 
         t11_cands = [c for c in t11_cands if not in_exempt(c)]
 
+        def judge_t19():
+            # 主体跨镜头色相直方图距离作为附加像素证据（>0.5 提示 VLM 重点核对）
+            hue_flags = []
+            for subj, per_shot in sub_info.get('shot_hue', {}).items():
+                ks = sorted(per_shot)
+                if len(ks) < 2:
+                    continue
+                ref = per_shot[ks[0]]
+                for kk in ks[1:]:
+                    h = per_shot[kk]
+                    d = 1 - float(np.dot(h, ref)) / (
+                        np.linalg.norm(h) * np.linalg.norm(ref) + 1e-8)
+                    if d > 0.5:
+                        hue_flags.append(f'"{subj}" shot{ks[0]}→shot{kk} '
+                                         f'hue-hist dist {d:.2f}')
+            hue_ctx = ('A color probe flagged cross-shot appearance drift: '
+                       + '; '.join(hue_flags) + '.\n') if hue_flags else ''
+            v = vlm_t19_cross_shot(frames, ffps, spans, meta, rubric, hue_ctx)
+            if v.get('verdict') == 'defect':
+                return dict(type='T19_cross_shot', start_s=0.0,
+                            end_s=round(spans[-1][1], 2),
+                            severity=int(v.get('severity', 3)),
+                            evidence=f'跨镜头{v.get("aspect", "")}不一致'
+                                     f'{("（色相探针同报：" + "; ".join(hue_flags) + "）") if hue_flags else ""}：'
+                                     f'{v.get("reason", "")}'[:250],
+                            confidence=float(v.get('confidence', 0.7)),
+                            verdict_by='dual' if hue_flags else 'vlm')
+
+        def judge_loop(c):
+            v = vlm_t17_loop(frames, ffps, c, meta, rubric)
+            if v.get('verdict') == 'defect':
+                return dict(type='T17_motion_dynamics', start_s=c['start_s'],
+                            end_s=c['end_s'], severity=int(v.get('severity', 3)),
+                            evidence=f'分镜{c["shot"]} 内容不自然循环（自相关峰 '
+                                     f'{c["peak"]}）：{v.get("reason", "")}'[:220],
+                            confidence=float(v.get('confidence', 0.7)),
+                            verdict_by='dual')
+
         # 除 rubric 外全部 VLM 调用并行（Bedrock 侧无依赖）
         with ThreadPoolExecutor(max_workers=16) as pool:
             fut_wins = [pool.submit(judge_window, w) for w in wins]
@@ -833,6 +1040,10 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                 + [pool.submit(judge_t11, c) for c in t11_cands]
             fut_t10 = [(k, [pool.submit(judge_t10, (k, s)) for _ in range(T10_VOTES)])
                        for k, s in enumerate(meta['shots']) if k < len(spans)]
+            # T19 跨镜头一致性（多分镜才有意义）；T17 循环候选；T20 改写忠实度
+            fut_t19 = pool.submit(judge_t19) if len(spans) >= 2 else None
+            fut_loops = [pool.submit(judge_loop, c) for c in t17_loop_cands]
+            fut_rw = pool.submit(check_rewrite_fidelity, meta, pdir)
             for f in fut_wins + fut_cands:
                 vlm_calls += 1
                 r = f.result()
@@ -849,6 +1060,20 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                     t10.append(med)
                 else:
                     t10.append(votes[0])
+            for f in ([fut_t19] if fut_t19 else []) + fut_loops:
+                vlm_calls += 1
+                r = f.result()
+                if r:
+                    findings.append(r)
+            rw = fut_rw.result()
+            vlm_calls += 1
+            if rw.get('missing_critical'):
+                findings.append(dict(
+                    type='T20_pipeline', start_s=0.0, end_s=0.0, severity=2,
+                    evidence=f'导演改写丢失创意关键要素：'
+                             f'{"、".join(rw["missing_critical"][:5])}'
+                             f'（{rw.get("note", "")}）'[:220],
+                    confidence=0.8, verdict_by='llm'))
         t10.sort(key=lambda x: x['shot_id'])
         timing['s4_vlm_s'] = round(time.time() - t0, 2)
 

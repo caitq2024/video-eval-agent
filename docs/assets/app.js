@@ -4,7 +4,9 @@ const TYPE_ZH = {
   T3_freeze: 'T3 冻结', T4_unexpected_cut: 'T4 意外切换', T5_out_of_frame: 'T5 主体出界',
   T6_black: 'T6 黑帧', T7_deform: 'T7 主体变形', T8_identity_drift: 'T8 身份漂移',
   T9_vanish: 'T9 凭空消失', T10_misalignment: 'T10 语义不符',
-  T11_local_incoherence: 'T11 局部时序不连贯', vlm_defect: 'VLM 判定缺陷',
+  T11_local_incoherence: 'T11 局部时序不连贯', T17_motion_dynamics: 'T17 运动动态性',
+  T19_cross_shot: 'T19 跨镜头一致性', T20_pipeline: 'T20 管线执行',
+  vlm_defect: 'VLM 判定缺陷',
 };
 const STAGE_ZH = {
   t0_gate_s: 'T0 文件gate', s1_scan_s: 'S1 全帧扫描', s2_detect_s: 'S2 直判',
@@ -56,7 +58,7 @@ function findingsTable(findings, onSeek) {
     tr.appendChild(sv);
     tr.appendChild(el('td', '', f.evidence || ''));
     const vb = el('td');
-    const vbLabel = { detector: '直判', vlm: 'VLM', dual: '双重验证' }[f.verdict_by] || f.verdict_by;
+    const vbLabel = { detector: '直判', vlm: 'VLM', dual: '双重验证', llm: 'LLM文本' }[f.verdict_by] || f.verdict_by;
     vb.appendChild(el('span', `tag ${f.verdict_by}`, vbLabel));
     tr.appendChild(vb);
     tr.onclick = () => onSeek && onSeek(f.start_s);

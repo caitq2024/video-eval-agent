@@ -160,6 +160,12 @@ def outputs(p):
     return send_from_directory(OUT_ROOT, p)
 
 
+@app.get('/demo.html')
+def demo_page():
+    # demo 页已从 Pages 前端下线（客户要求），只随演示服务器提供
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'demo.html')
+
+
 @app.get('/')
 @app.get('/<path:p>')
 def static_docs(p='index.html'):
