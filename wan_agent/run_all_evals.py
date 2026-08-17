@@ -22,7 +22,7 @@ if __name__ == '__main__':
     for pid in sorted(os.listdir(OUT_ROOT)):
         if pid.startswith('demo_'):
             continue                     # 客户现场 demo 任务不进正式批量
-        for mk in ('wan2.1', 'wan2.2'):
+        for mk in ('wan2.1', 'wan2.2', 'minimax-h3'):
             film = os.path.join(OUT_ROOT, pid, mk, 'film.mp4')
             ej = os.path.join(OUT_ROOT, pid, mk, 'eval.json')
             if not os.path.exists(film) or os.path.getsize(film) == 0:

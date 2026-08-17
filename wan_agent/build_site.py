@@ -36,7 +36,8 @@ def main():
     data = {'prompts': [], 'models': ['wan2.1', 'wan2.2'],
             'model_info': {
                 'wan2.1': {'label': 'Wan2.1-T2V-1.3B', 'size': '832x480', 'fps': 16},
-                'wan2.2': {'label': 'Wan2.2-TI2V-5B', 'size': '1280x704', 'fps': 24}}}
+                'wan2.2': {'label': 'Wan2.2-TI2V-5B', 'size': '1280x704', 'fps': 24},
+                'minimax-h3': {'label': 'MiniMax-H3-33B', 'size': '1366x768', 'fps': 24}}}
     def natkey(p):
         import re
         m = re.search(r'\d+', p)
@@ -54,7 +55,7 @@ def main():
                  'director_wall_s': meta.get('director_wall_s'),
                  'shots': meta['shots'], 'generation': meta.get('generation', {}),
                  'films': meta.get('films', {}), 'evals': {}}
-        for mk in ('wan2.1', 'wan2.2'):
+        for mk in ('wan2.1', 'wan2.2', 'minimax-h3'):
             ep = os.path.join(OUT_ROOT, pid, mk, 'eval.json')
             if os.path.exists(ep):
                 e = json.load(open(ep))

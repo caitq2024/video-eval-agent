@@ -33,6 +33,13 @@ MODELS = {
         # 不加 --t5_cpu：offload 模式下 T5 用完即回 CPU，GPU 编码快 10 min
         'extra': ['--offload_model', 'True', '--convert_model_dtype'],
     },
+    'minimax-h3': {
+        # 33B 音视频一体生成（SGLang 服务化，见 generate_h3.py）；带 32kHz 立体声
+        'ckpt': '/home/ec2-user/efs/base_model/MiniMax-H3', 'task': 't2va',
+        'size': '1366*768', 'fps': 24,
+        'frames_for': lambda dur: int(dur * 24),
+        'extra': [],
+    },
 }
 
 _client = None
