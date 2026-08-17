@@ -16,13 +16,14 @@ DOCS = os.path.join(REPO, 'docs')
 VID_DIR = os.path.join(DOCS, 'assets', 'videos')
 
 
-def transcode(src, dst, max_h=480):
+def transcode(src, dst, max_h=480, keep_audio=False):
     if os.path.exists(dst) and os.path.getmtime(dst) > os.path.getmtime(src):
         return
     vf = f"scale=-2:'min({max_h},ih)'"
+    audio = ['-c:a', 'aac', '-b:a', '96k'] if keep_audio else ['-an']
     r = subprocess.run([FFMPEG, '-y', '-i', src, '-vf', vf, '-c:v', 'libx264',
                         '-crf', '26', '-preset', 'slow', '-pix_fmt', 'yuv420p',
-                        '-movflags', '+faststart', '-an', dst],
+                        '-movflags', '+faststart', *audio, dst],
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f'transcode fail {src}: {r.stderr[-300:]}')
@@ -33,11 +34,11 @@ def main():
     ap.add_argument('--skip-videos', action='store_true')
     a = ap.parse_args()
     os.makedirs(VID_DIR, exist_ok=True)
-    data = {'prompts': [], 'models': ['wan2.1', 'wan2.2'],
+    data = {'prompts': [], 'models': ['wan2.1', 'wan2.2', 'minimax-h3'],
             'model_info': {
                 'wan2.1': {'label': 'Wan2.1-T2V-1.3B', 'size': '832x480', 'fps': 16},
                 'wan2.2': {'label': 'Wan2.2-TI2V-5B', 'size': '1280x704', 'fps': 24},
-                'minimax-h3': {'label': 'MiniMax-H3-33B', 'size': '1366x768', 'fps': 24}}}
+                'minimax-h3': {'label': 'MiniMax-H3-33B', 'size': '1344x768', 'fps': 24}}}
     def natkey(p):
         import re
         m = re.search(r'\d+', p)
@@ -67,7 +68,8 @@ def main():
                     src = os.path.join(OUT_ROOT, pid, mk, name)
                     if os.path.exists(src) and os.path.getsize(src) > 0:
                         dst = os.path.join(VID_DIR, f'{pid}_{mk}_{name}')
-                        transcode(src, dst)
+                        # H3 音视频一体生成，保留分镜/成片音轨作为特色展示
+                        transcode(src, dst, keep_audio=(mk == 'minimax-h3'))
         data['prompts'].append(entry)
     out = os.path.join(DOCS, 'data', 'data.json')
     os.makedirs(os.path.dirname(out), exist_ok=True)

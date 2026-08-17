@@ -78,7 +78,7 @@ def main():
             res = gen_one(a.base, prompt, out, seed, int(dur))
         except Exception as e:
             res = {'ok': False, 'gen_wall_s': 0, 'log_tail': f'{type(e).__name__}: {e}'[:300]}
-        res.update({'seed': seed, 'fps': 24, 'size': '1366*768'})
+        res.update({'seed': seed, 'fps': 24, 'size': '1344*768'})
         print(f'[h3] done  {pid}/shot{sid} ok={res["ok"]} {res["gen_wall_s"]}s')
         return pid, sid, res
 

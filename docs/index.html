@@ -15,21 +15,21 @@
       <a href="method.html">评估方法</a>
       <a href="https://github.com/caitq2024/video-eval-agent">GitHub</a>
     </nav>
-    <span class="sub">创意 → 导演分镜 → Wan2.1/2.2 生成 → 转场拼接 → 全帧探针 + Hybrid 裁决</span>
+    <span class="sub">创意 → 导演分镜 → Wan2.1/2.2 · MiniMax-H3 生成 → 转场拼接 → 全帧探针 + Hybrid 裁决</span>
   </header>
 
   <div class="card">
     <div class="pipeline-steps">
       <span class="step">💡 一句话创意</span><span class="arr">→</span>
       <span class="step">🎬 导演 Agent（Claude Sonnet 4.5）拆 3 分镜</span><span class="arr">→</span>
-      <span class="step">🎞 Wan2.1-1.3B / Wan2.2-5B 各生成 3×5s</span><span class="arr">→</span>
+      <span class="step">🎞 Wan2.1-1.3B / Wan2.2-5B / MiniMax-H3-33B 各生成 3×5s</span><span class="arr">→</span>
       <span class="step">✂️ ffmpeg 按分镜转场拼接</span><span class="arr">→</span>
       <span class="step">🔍 评估 Agent：全帧扫描 + 直判 + GroundingDINO + Claude 裁决</span>
     </div>
     <div class="grid cols3" id="stats" style="margin-top:14px"></div>
   </div>
 
-  <h2>5 个创意 × 2 个模型</h2>
+  <h2>10 个创意 × 3 个生成基座（MiniMax-H3 先行覆盖 4 个重点 case，带声音 🔊）</h2>
   <div class="grid cols2" id="cards"></div>
 </div>
 <script src="assets/app.js"></script>
@@ -67,6 +67,8 @@ loadData().then(data => {
     c.appendChild(el('div', 'idea', p.idea));
     const ms = el('div', 'models');
     data.models.forEach(mk => {
+      // 该模型没出过片也没评估 → 不渲染空瓦片（如 H3 未覆盖的 case）
+      if (!p.films[mk] && !p.evals[mk]) return;
       const e = p.evals[mk];
       const a = el('a', 'mtile');
       a.href = `detail.html?pid=${p.id}&model=${mk}`;
@@ -85,7 +87,7 @@ loadData().then(data => {
     c.appendChild(ms);
     const cmp = el('div');
     cmp.style.marginTop = '10px';
-    const link = el('a', '', '⇆ 并排对比两个模型');
+    const link = el('a', '', '⇆ 并排对比模型');
     link.href = `compare.html?pid=${p.id}`;
     cmp.appendChild(link);
     c.appendChild(cmp);

@@ -48,7 +48,7 @@ h3 { font-size: 15px; margin: 18px 0 8px; }
 
 /* prompt card */
 .pcard .idea { font-weight: 600; margin: 2px 0 10px; }
-.pcard .models { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.pcard .models { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
 .mtile {
   background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
   padding: 10px; display: block; color: var(--ink);

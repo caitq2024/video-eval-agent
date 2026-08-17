@@ -23,14 +23,18 @@ loadData().then(data => {
   const main = document.getElementById('main');
   if (!p) { main.textContent = '未找到该 prompt'; return; }
   document.title = `${p.title_zh || p.id} · 模型对比`;
+  // 只对比该 case 实际有产物/评估的模型
+  const models = data.models.filter(mk => p.films[mk] || p.evals[mk]);
   const head = el('div', 'card');
-  const h = el('h2', '', `${p.id} ${p.title_zh || ''} · Wan2.1 vs Wan2.2`);
+  const h = el('h2', '', `${p.id} ${p.title_zh || ''} · ` +
+    models.map(mk => data.model_info[mk].label).join(' vs '));
   h.style.margin = '0 0 6px'; head.appendChild(h);
   head.appendChild(el('div', 'sub', `创意：${p.idea}`));
   main.appendChild(head);
 
-  const g = el('div', 'grid cols2'); g.style.marginTop = '16px';
-  data.models.forEach(mk => {
+  const g = el('div', `grid ${models.length >= 3 ? 'cols3' : 'cols2'}`);
+  g.style.marginTop = '16px';
+  models.forEach(mk => {
     const e = p.evals[mk];
     const c = el('div', 'card');
     const t = el('h3', '', data.model_info[mk].label); t.style.marginTop = '0';
@@ -65,27 +69,27 @@ loadData().then(data => {
   });
   main.appendChild(g);
 
-  // 结论区
-  const e1 = p.evals['wan2.1'], e2 = p.evals['wan2.2'];
-  if (e1 && e2) {
+  // 结论区：所有已评估模型横向对比
+  const evaled = models.filter(mk => p.evals[mk]);
+  if (evaled.length >= 2) {
     const cc = el('div', 'card'); cc.style.marginTop = '16px';
     cc.appendChild(el('h3', '', '同 prompt 对比'));
     const tb = el('table');
     const th = el('tr');
-    ['指标', 'Wan2.1-1.3B', 'Wan2.2-5B'].forEach(x => th.appendChild(el('th', '', x)));
+    ['指标', ...evaled.map(mk => data.model_info[mk].label)]
+      .forEach(x => th.appendChild(el('th', '', x)));
     tb.appendChild(th);
     const rows = [
-      ['总分', e1.scores.total, e2.scores.total],
-      ['缺陷数', e1.findings.length, e2.findings.length],
-      ['硬失败', e1.scores.hard_fails.join(',') || '无', e2.scores.hard_fails.join(',') || '无'],
-      ['语义对齐均分', avg(e1.t10_alignment), avg(e2.t10_alignment)],
-      ['评估耗时', fmtS(e1.timing.total_s), fmtS(e2.timing.total_s)],
+      ['总分', e => e.scores.total],
+      ['缺陷数', e => e.findings.length],
+      ['硬失败', e => e.scores.hard_fails.join(',') || '无'],
+      ['语义对齐均分', e => avg(e.t10_alignment)],
+      ['评估耗时', e => fmtS(e.timing.total_s)],
     ];
-    rows.forEach(([k, a, b]) => {
+    rows.forEach(([k, fn]) => {
       const tr = el('tr');
       tr.appendChild(el('td', '', k));
-      tr.appendChild(el('td', 'num', String(a)));
-      tr.appendChild(el('td', 'num', String(b)));
+      evaled.forEach(mk => tr.appendChild(el('td', 'num', String(fn(p.evals[mk])))));
       tb.appendChild(tr);
     });
     cc.appendChild(tb);
