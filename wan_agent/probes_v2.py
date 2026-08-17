@@ -30,24 +30,26 @@ def get_kp_model(device):
     return _KP_MODEL[device]
 
 
-def person_keypoints(frames_rgb, device, batch=8):
-    """frames_rgb: N,H,W,3 uint8（探针子采样帧）→ 每帧最高分人物的 (17,3) 关键点或 None"""
+def person_keypoints(frames_rgb, device, batch=8, with_second=False):
+    """frames_rgb: N,H,W,3 uint8（探针子采样帧）→ 每帧最高分人物的 (17,3) 关键点或 None。
+    with_second=True 时额外返回每帧第二高分人物（R11：多人场景第二人的手曾是盲区）。"""
     import torch
     m = get_kp_model(device)
-    out = []
+    out, out2 = [], []
     with torch.no_grad():
         for i in range(0, len(frames_rgb), batch):
             imgs = [torch.from_numpy(f.copy()).permute(2, 0, 1).float().div(255).to(device)
                     for f in frames_rgb[i:i + batch]]
             for r in m(imgs):
-                if len(r['scores']) and float(r['scores'][0]) > 0.75:
-                    kp = r['keypoints'][0].cpu().numpy()        # 17,3 (x,y,vis)
-                    ks = r['keypoints_scores'][0].cpu().numpy()
-                    kp[:, 2] = ks
-                    out.append(kp)
-                else:
-                    out.append(None)
-    return out
+                def take(j):
+                    kp = r['keypoints'][j].cpu().numpy()        # 17,3 (x,y,vis)
+                    kp[:, 2] = r['keypoints_scores'][j].cpu().numpy()
+                    return kp
+                out.append(take(0) if len(r['scores'])
+                           and float(r['scores'][0]) > 0.75 else None)
+                out2.append(take(1) if len(r['scores']) > 1
+                            and float(r['scores'][1]) > 0.75 else None)
+    return (out, out2) if with_second else out
 
 
 def t12_bone_stats(kps, sub_fps, spans, shots):
@@ -94,7 +96,9 @@ def wrist_regions(kps, sub_fps, spans, w, h):
             for wrist in (9, 10):
                 if kp[wrist, 2] > 2:
                     x, y = kp[wrist, 0], kp[wrist, 1]
-                    r = scale * 0.45
+                    # R11：近景躯干尺度大 → 裁剪框过大，手在并排图里缩得太小
+                    # 看不清（p5 shot3 后手漏检）。半径封顶 70px（640 宽坐标系）
+                    r = min(scale * 0.45, 70.0)
                     regs.append((round(i / sub_fps, 2),
                                  [max(0, x - r), max(0, y - r),
                                   min(w, x + r), min(h, y + r)], k + 1))

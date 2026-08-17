@@ -64,6 +64,66 @@ def exempt_mask(n, fps, trans, margin):
     return m
 
 
+_FLY_RE = None
+
+
+def trajectory_hover_cands(meta, spans, sub_info, cam):
+    """R11：飞行/抛体轨迹探针（detector 主判候选）。
+    prompt 声称 flying/thrown 的非人物主体，在**近静止机位**窗口内若质心 5-95 分位
+    位移 < 8% 画宽且持续 ≥2.5s → 悬停候选（违反弹道：抛体必须位移/下坠）。
+    机位在动（tracking 跟拍会让飞行物帧内静止）时不直判，留给 VLM judge_t13。"""
+    global _FLY_RE
+    import re as _re
+    if _FLY_RE is None:
+        _FLY_RE = _re.compile(r'fly|flying|airborne|mid-?air|in the air|thrown|'
+                              r'tossed|soar|glide')
+    person_kw = ('person', 'man', 'woman', 'soldier', 'pedestrian', 'fencer',
+                 'player', 'elderly', 'people', 'figure', 'dog', 'corgi', 'cat',
+                 'model', 'clerk', 'colleague', 'worker', 'owner')
+    boxes_all = sub_info.get('boxes', {})
+    sub_fps = sub_info.get('sub_fps') or 8.0
+    dx = np.asarray(cam.get('dx', []), np.float32)
+    dy = np.asarray(cam.get('dy', []), np.float32)
+    cam_mag = np.hypot(dx, dy) if len(dx) else None
+    out = []
+    for k, (a, b) in enumerate(spans):
+        if k >= len(meta['shots']):
+            break
+        s = meta['shots'][k]
+        if not _FLY_RE.search(s.get('wan_prompt', '').lower()):
+            continue
+        # 机位须近静止（cam 时间轴同 fps/3 ≈ sub_fps；单位 px/子步 @320 宽）
+        if cam_mag is not None:
+            lo_c, hi_c = max(1, int(a * sub_fps)), int(b * sub_fps)
+            seg = cam_mag[lo_c:hi_c]
+            if len(seg) >= 5 and float(np.median(seg)) > 1.5:
+                continue
+        for subj, bxs in boxes_all.items():
+            if any(w in subj.lower() for w in person_kw):
+                continue
+            lo, hi = int(a * sub_fps), min(len(bxs), int(b * sub_fps))
+            pts = [(i, bx) for i, bx in enumerate(bxs[lo:hi]) if bx]
+            if len(pts) < max(6, int((hi - lo) * 0.5)):
+                continue                       # 检出覆盖不足，证据不充分
+            span_t = (pts[-1][0] - pts[0][0]) / sub_fps
+            if span_t < 2.5:
+                continue
+            cs = np.asarray([[(bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2]
+                             for _, bx in pts], np.float32)
+            rng = np.percentile(cs, 95, axis=0) - np.percentile(cs, 5, axis=0)
+            disp = float(np.hypot(rng[0], rng[1]))
+            # 速度判据：真实飞行物横穿画面 ≥ 数百px/s，悬停/漂移 < 40px/s
+            # （p2 飞盘实测 14px/s；位移绝对值阈值会漏掉慢漂移）。深度方向运动、
+            # 被接住/握持等歧义留给 VLM 终审仲裁。
+            speed = disp / max(span_t, 0.1)
+            if speed < 40.0:
+                out.append(dict(shot=k + 1, subject=subj,
+                                start_s=round(a, 2), end_s=round(b, 2),
+                                disp_px=round(disp, 1), span_t=round(span_t, 1),
+                                speed_px_s=round(speed, 1)))
+    return out
+
+
 def runs_where(cond):
     """布尔数组 → [(start_idx, end_idx)] 连续段（闭开区间）。"""
     out, i, n = [], 0, len(cond)
@@ -755,6 +815,15 @@ def vlm_window_verdict(frames, fps, win, meta, rubric, context, trans_txt=''):
          f'Below are 8 frames from that region (timestamps burned in).\n'
          f'Judge SPECIFICALLY: is there a real quality defect there (subject discontinuity, '
          f'unintended exit, morphing, artifact), or is it acceptable/intentional?\n'
+         f'NOTE: a subject moving OUT OF FRAME (partly or fully) under dynamic '
+         f'framing is normal cinematography, NOT disappearance — especially if '
+         f'evidence of them (a limb, held prop, shadow) stays in frame; '
+         f'disappearance means dissolving/vanishing IN PLACE between nearby '
+         f'frames while the framing still covers where they stood. HOWEVER, if '
+         f'the storyboard requires the subject visibly performing an action in '
+         f'this window and the frames instead show large empty/black regions '
+         f'with the subject nowhere, that IS a real defect (missing subject), '
+         f'not a framing choice.\n'
          f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", '
          f'"type": "<short defect type or none>", "severity": 1-5, '
          f'"reason": "<简体中文简述，给中国客户看>", "confidence": 0.0-1.0}}')
@@ -882,10 +951,12 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
     if has_person:
         try:
             sub_frames = decode_sub(film)
-            kps = PV2.person_keypoints(sub_frames[::2], device)
+            kps, kps2 = PV2.person_keypoints(sub_frames[::2], device,
+                                             with_second=True)
             kfps = (fps / SUB_EVERY) / 2
             t12_cands = PV2.t12_bone_stats(kps, kfps, spans, meta['shots'])
-            hand_regs = PV2.wrist_regions(kps, kfps, spans, 640, 360)
+            hand_regs = (PV2.wrist_regions(kps, kfps, spans, 640, 360)
+                         + PV2.wrist_regions(kps2, kfps, spans, 640, 360))
         except Exception as e:
             print('[v2] keypoint probe fail:', str(e)[:120])
     inter_regs = PV2.interaction_regions(sub_info, spans,
@@ -895,10 +966,15 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
     text_shots = [(k, s, PV2.prompt_texts(s)) for k, s in enumerate(meta['shots'])
                   if k < len(spans) and PV2.prompt_texts(s)]
     import re as _re
+    # R11 修复：补飞行/追逐/悬浮类动词（p2 飞盘悬停曾因 "flying" 不在表内漏检）
     PHYS = _re.compile(r'bounc|fall|drop|pour|splash|roll|slide|toss|throw|'
-                       r'gravity|ripple|settle|rebound')
+                       r'gravity|ripple|settle|rebound|fly|flying|glide|chas|'
+                       r'catch|spin|float|hover|soar|leap|jump|swing')
     phys_shots = [(k, s) for k, s in enumerate(meta['shots'])
                   if k < len(spans) and PHYS.search(s['wan_prompt'].lower())][:2]
+    # R11 修复：T13 轨迹探针 —— 声称飞行/抛体的非人物主体，静止机位下位移≈0 → 悬停候选
+    t13_traj_cands = trajectory_hover_cands(meta, spans, sub_info,
+                                            sc.get('camera_flow', {}))
     timing['s3b_v2_s'] = round(time.time() - t0, 2)
 
     # S4 fusion windows + VLM adjudication
@@ -988,6 +1064,11 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
             by = 'vlm'
             if any(k in claim for k in vanish_kw):
                 wp = window_presence(w)
+                # R11：全片检出率（探测能力）——盲区主体（如细剑 0% 检出）不得
+                # 参与否决/佐证（p5 曾用 épées=0% 佐证"人消失"，主张与证据错位）
+                gp = {s: (sum(arr) / max(1, len(arr)))
+                      for s, arr in presence.items()}
+                wp = {s: r for s, r in wp.items() if gp.get(s, 0.0) >= 0.10}
                 singular = {s: r for s, r in wp.items()
                             if s.lower().startswith(('a ', 'an '))}
                 if singular and min(singular.values()) >= 0.95:
@@ -997,7 +1078,10 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                         rejected_because='跟踪器主判否决：窗口内单实例主体检出率 '
                         + ', '.join(f'{s}={r * 100:.0f}%' for s, r in singular.items())))
                     return None
-                if wp and min(wp.values()) < 0.6:
+                # dual 佐证收紧：仅当探测器平时可靠（全片≥50%）的主体在窗口显著缺失
+                absent = {s: r for s, r in wp.items()
+                          if gp.get(s, 0.0) >= 0.5 and r < 0.4}
+                if absent:
                     by = 'dual'                 # VLM + 跟踪器双重确认
                     conf = max(conf, 0.9)
                 else:
@@ -1099,11 +1183,21 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
         import vlm_common as V
 
         def judge_t12_hands():
-            """手部/持物区域批量核查（一张并排图一次调用）—— p4 类雨伞/手缺陷主打。"""
+            """手部/持物区域批量核查（一张并排图一次调用）—— p4 类雨伞/手缺陷主打。
+            R11：按分镜 round-robin 交错取样（原 [:6] 截断永远丢弃后段分镜——
+            p5 shot3 后手解剖异常因此漏检）。"""
             if not hand_regs:
                 return []
+            by_shot = {}
+            for reg in hand_regs:
+                by_shot.setdefault(reg[2], []).append(reg)
+            sel = []
+            while any(by_shot.values()) and len(sel) < 6:
+                for sh in sorted(by_shot):
+                    if by_shot[sh] and len(sel) < 6:
+                        sel.append(by_shot[sh].pop(0))
             items = [(t, box, f'H{i + 1}') for i, (t, box, sh)
-                     in enumerate(hand_regs[:6])]
+                     in enumerate(sel)]
             strip = crop_strip(frames, ffps, items)
             p = (f'You are inspecting HAND/GRIP regions of an AI-generated video '
                  f'(idea: "{meta["idea"]}"). Each labeled crop (H1..H{len(items)}) is an '
@@ -1126,7 +1220,7 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
             for ab in (parsed or {}).get('abnormal', []):
                 try:
                     i = int(str(ab.get('id', 'H1'))[1:]) - 1
-                    t_s, _, sh = hand_regs[i]
+                    t_s, _, sh = sel[i]
                 except (ValueError, IndexError):
                     continue
                 out.append(dict(type='T12_anatomy', start_s=t_s,
@@ -1221,16 +1315,33 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                                     cols=4, tile_w=300)
             p = (f'Physics check for shot {k + 1} of an AI video.\n'
                  f'Shot prompt: "{s["wan_prompt"]}"\n'
-                 f'Step 1: state 2-3 physics assertions this scene must satisfy '
-                 f'(gravity/momentum/contact response/state persistence, e.g. "a '
-                 f'bouncing ball\'s rebound height must decrease").\n'
-                 f'Step 2: check each against the 8 frames (timestamps burned in).\n'
-                 f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", '
+                 f'Step 1: state 1-3 physics LAWS whose violation a real camera '
+                 f'could never film. VALID examples: water must not flow upward; '
+                 f'an unsupported object must not rise or hover mid-air; a '
+                 f'free-falling object must descend monotonically, never pause '
+                 f'or bounce upward before contact; a rigid object must not '
+                 f'change shape; a mirror must reflect the person in front of '
+                 f'it with matching pose; solid objects must not pass through '
+                 f'each other; a bouncing ball\'s rebound height must decrease.\n'
+                 f'INVALID (do NOT assert): demands that resting/adhered objects '
+                 f'"must keep moving" (droplets may legitimately stay adhered by '
+                 f'surface tension; settled objects stay still) or stylistic '
+                 f'pacing expectations — objects plausibly at rest or in '
+                 f'equilibrium are physically VALID even if the prompt implies '
+                 f'motion.\n'
+                 f'Step 2: check each against the 8 frames (timestamps burned in). '
+                 f'Report defect ONLY for a clear violation visible across '
+                 f'multiple frames, not a single ambiguous frame. If the frames '
+                 f'are insufficient to decide, answer cannot_determine instead '
+                 f'of guessing.\n'
+                 f'Respond ONLY with JSON: {{"verdict": "defect|acceptable|'
+                 f'cannot_determine", '
                  f'"violated": ["<被违反的断言,中文>"], "severity": 1-5, '
                  f'"reason": "<简体中文>", "confidence": 0.0-1.0}}')
             parsed, _ = ask_claude([{'text': p}, V.img_block(sheet)])
             v = parsed or {}
-            if v.get('verdict') == 'defect':
+            # R11：VLM 单票低置信物理结论不计分（p3 水珠误报 conf=0.6）
+            if v.get('verdict') == 'defect' and float(v.get('confidence', 0)) >= 0.7:
                 return dict(type='T13_physics', start_s=round(a, 2), end_s=round(b, 2),
                             severity=int(v.get('severity', 3)),
                             evidence=f'物理断言违反（分镜{k + 1}）：'
@@ -1238,6 +1349,44 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                                      f'{v.get("reason", "")}'[:220],
                             confidence=float(v.get('confidence', 0.7)),
                             verdict_by='vlm')
+
+        def judge_t13_traj(c):
+            """R11：轨迹探针候选终审 —— 探针负责测量（悬停位移），VLM 只做语义
+            仲裁（是否存在物理合法解释：搁在表面/被握持/悬挂），不做测量。"""
+            a, b = c['start_s'], c['end_s']
+            n_f = len(frames)
+            ids = [min(n_f - 1, int((a + (b - a) * (i + 0.5) / 8) * ffps))
+                   for i in range(8)]
+            sheet = V.contact_sheet([(frames[j], j / ffps) for j in ids],
+                                    cols=4, tile_w=300)
+            sp = meta['shots'][c['shot'] - 1]
+            p = (f'A tracker measured "{c["subject"]}" in shot {c["shot"]} of an '
+                 f'AI video: its position stayed within {c["disp_px"]}px (frame '
+                 f'width 640px) for {c["span_t"]}s while the camera was static — '
+                 f'i.e. it hovered nearly motionless.\n'
+                 f'Shot prompt claims: "{sp["wan_prompt"]}"\n'
+                 f'A thrown/flying object must traverse space and/or descend '
+                 f'under gravity; even in slow motion it must move noticeably '
+                 f'over {c["span_t"]}s. Judge from the 8 frames whether a '
+                 f'physically valid explanation exists (object resting on a '
+                 f'surface, held by someone, hanging from something). If none, '
+                 f'this is a physics defect.\n'
+                 f'Respond ONLY with JSON: {{"verdict": "defect|acceptable", '
+                 f'"severity": 1-5, "reason": "<简体中文>", '
+                 f'"confidence": 0.0-1.0}}')
+            parsed, _ = ask_claude([{'text': p}, V.img_block(sheet)])
+            v = parsed or {}
+            if v.get('verdict') == 'defect':
+                return dict(type='T13_physics', start_s=round(a, 2),
+                            end_s=round(b, 2),
+                            severity=int(v.get('severity', 4)),
+                            evidence=f'轨迹探针（分镜{c["shot"]}）："{c["subject"]}" '
+                                     f'声称飞行/抛体，但静止机位下 {c["span_t"]}s 内'
+                                     f'移动速度仅 {c.get("speed_px_s", "?")}px/s'
+                                     f'（真实飞行物应数百px/s），近乎悬停'
+                                     f'——违反弹道物理。{v.get("reason", "")}'[:220],
+                            confidence=max(0.9, float(v.get('confidence', 0.9))),
+                            verdict_by='dual')
 
         # 除 rubric 外全部 VLM 调用并行（Bedrock 侧无依赖）
         with ThreadPoolExecutor(max_workers=16) as pool:
@@ -1256,6 +1405,7 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
             fut_inter = [pool.submit(judge_t14, r) for r in inter_regs]
             fut_text = [pool.submit(judge_t15, k, s, tx) for k, s, tx in text_shots]
             fut_phys = [pool.submit(judge_t13, k, s) for k, s in phys_shots]
+            fut_traj = [pool.submit(judge_t13_traj, c) for c in t13_traj_cands]
             for f in fut_wins + fut_cands:
                 vlm_calls += 1
                 r = f.result()
@@ -1273,7 +1423,7 @@ def evaluate(pid, model, device='cuda:0', use_vlm=True):
                 else:
                     t10.append(votes[0])
             for f in ([fut_t19] if fut_t19 else []) + fut_loops + fut_bones \
-                    + fut_inter + fut_text + fut_phys:
+                    + fut_inter + fut_text + fut_phys + fut_traj:
                 vlm_calls += 1
                 r = f.result()
                 if r:
