@@ -42,7 +42,9 @@ def main():
     def natkey(p):
         import re
         m = re.search(r'\d+', p)
-        return (int(m.group()) if m else 0, p)
+        # p 系列测试 case 在前，d 系列短剧殿后，其余（上传件等）最后
+        tier = 0 if p.startswith('p') else 1 if p.startswith('d') else 2
+        return (tier, int(m.group()) if m else 0, p)
 
     for pid in sorted(os.listdir(OUT_ROOT), key=natkey):
         if pid.startswith('demo_'):
